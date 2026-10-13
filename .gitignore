@@ -1,8 +1,90 @@
+# ═══════════════════════════════════════════════
+#  Entornos virtuales y Python
+# ═══════════════════════════════════════════════
 .venv/
-node_modules/
+venv/
+env/
 __pycache__/
-*.env
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ═══════════════════════════════════════════════
+#  Node / Electron
+# ═══════════════════════════════════════════════
+node_modules/
+.npm/
+.yarn/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+# binarios de Electron (se reinstalan con npm install)
+electron/dist/
+
+# ═══════════════════════════════════════════════
+#  Secretos y configuración local (NUNCA subir)
+# ═══════════════════════════════════════════════
+.env
+.env.*
 !.env.example
+*.pem
+*.key
+credentials*
+secrets*
+*token*
+
+# ═══════════════════════════════════════════════
+#  Modelos de IA y binarios pesados
+#  (se descargan/reinstalan, no van en git)
+# ═══════════════════════════════════════════════
+*.onnx
+*.pt
+*.pth
+*.gguf
+*.safetensors
+*.ckpt
+*.pkl
+tesseract/
+*.AppImage
+*.deb
+*.rpm
+
+# ═══════════════════════════════════════════════
+#  Logs y temporales
+# ═══════════════════════════════════════════════
 *.log
 logs/
-*.onnx
+*.tmp
+*.bak
+*~
+.backup_*/
+
+# ═══════════════════════════════════════════════
+#  Multimedia pesada
+# ═══════════════════════════════════════════════
+*.mp3
+*.mp4
+*.wav
+*.avi
+*.mkv
+*.zip
+*.tar.gz
+*.7z
+*.rar
+
+# ═══════════════════════════════════════════════
+#  Sistema operativo / IDE
+# ═══════════════════════════════════════════════
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo
