@@ -14,6 +14,7 @@ pueda tumbar el sistema ni escapar de los límites de recursos.
 """
 
 import asyncio
+import json
 import logging
 import os
 import platform
@@ -73,6 +74,7 @@ class OSController:
             "whoami": CommandSafety.SAFE, "uname": CommandSafety.SAFE,
             "df": CommandSafety.SAFE, "free": CommandSafety.SAFE,
             "hostname": CommandSafety.SAFE, "which": CommandSafety.SAFE,
+            "lspci": CommandSafety.SAFE, "lsblk": CommandSafety.SAFE,
             "top": CommandSafety.SAFE, "ps": CommandSafety.SAFE,
             "xdg-open": CommandSafety.SAFE, "nautilus": CommandSafety.SAFE,
             "gedit": CommandSafety.SAFE, "firefox": CommandSafety.SAFE,
@@ -189,6 +191,191 @@ class OSController:
         dirs = ("/usr/share/applications", "/var/lib/flatpak/exports/share/applications",
                 os.path.expanduser("~/.local/share/applications"))
         return any(os.path.exists(os.path.join(d, name + ".desktop")) for d in dirs)
+
+    # Cache de apps Flatpak instaladas (evita invocar `flatpak list` en cada lance).
+    _flatpak_cache: tuple = (0.0, [])          # (ts, [(appid, nombre)])
+
+    async def _flatpak_app_id(self, name: str) -> Optional[str]:
+        """Busca una app Flatpak por id o nombre ('leocad' → org.leocad.LeoCAD)."""
+        cls = type(self)
+        if time.time() - cls._flatpak_cache[0] > 300:      # refresca cada 5 min
+            apps = []
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "flatpak", "list", "--app", "--columns=application,name",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL)
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
+                for line in out.decode(errors="ignore").splitlines():
+                    appid, _, appname = line.partition("\t")
+                    if appid.strip():
+                        apps.append((appid.strip(), appname.strip()))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("flatpak list falló: %r", exc)
+                return None
+            cls._flatpak_cache = (time.time(), apps)
+        needle = name.lower().replace(" ", "").replace("-", "")
+        for appid, appname in cls._flatpak_cache[1]:
+            parts = [p for p in appid.lower().split(".") if p]
+            if (needle in parts or needle == appid.lower()
+                    or needle == appname.lower().replace(" ", "").replace("-", "")):
+                return appid
+        return None
+
+    async def mount_usb(self, hint: str = "") -> CommandResult:
+        """Monta (si hace falta) un USB/pendrive y lo abre en el gestor de
+        archivos. `hint` es una pista de etiqueta ('ventoy'). Sin privilegios:
+        usa udisksctl, que monta como el usuario de sesión."""
+        start = time.time()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "lsblk", "-J", "-o", "NAME,LABEL,MOUNTPOINT,FSTYPE,TYPE,RM",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
+            devices = json.loads(out.decode(errors="ignore")).get("blockdevices", [])
+        except Exception as exc:  # noqa: BLE001
+            return CommandResult(False, "", f"No pude inspeccionar los discos: {exc}",
+                                 1, time.time() - start, "lsblk")
+
+        # Candidatos: particiones/medas extraíbles con etiqueta o sistema de archivos
+        parts = []
+        for d in devices:
+            for p in (d.get("children") or []) + [d]:
+                if p.get("type") not in ("part", "disk"):
+                    continue
+                fst = (p.get("fstype") or "").strip()
+                lbl = (p.get("label") or "").strip()
+                if fst == "swap" or (not lbl and not fst):
+                    continue
+                if str(p.get("rm")) == "1" or lbl or fst in ("vfat", "exfat", "ntfs", "udf", "iso9660"):
+                    parts.append(p)
+        if hint:
+            pref = [p for p in parts
+                    if hint.lower() in ((p.get("label") or "") + (p.get("name") or "")).lower()]
+            parts = pref or parts
+        if not parts:
+            return CommandResult(False, "",
+                                 "No encontré ningún USB/pendrive conectado",
+                                 1, time.time() - start, "lsblk")
+
+        target = next((p for p in parts if not p.get("mountpoint")), parts[0])
+        mountpoint = target.get("mountpoint")
+        name = target.get("name") or ""
+        label = (target.get("label") or name).strip()
+
+        if not mountpoint:                                  # desmontado → montar
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "udisksctl", "mount", "-b", f"/dev/{name}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT)
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
+                text = out.decode(errors="ignore")
+                m = re.search(r"Mounted at (\S+)", text)
+                if m:
+                    mountpoint = m.group(1)
+                else:
+                    # El escritorio (GNOME/udisks) pudo montarlo casi a la vez:
+                    # udisksctl responde AlreadyMounted → lo consideramos éxito.
+                    m = re.search(r"already mounted at `([^']+)`", text)
+                    if m:
+                        mountpoint = m.group(1)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("udisksctl mount falló: %r", exc)
+            if not mountpoint:
+                return CommandResult(False, "",
+                                     f"No pude montar /dev/{name} (¿protección de escritura?)",
+                                     1, time.time() - start, "udisksctl")
+
+        # Abrirlo en el gestor de archivos con el entorno de la sesión gráfica
+        launcher = f"setsid xdg-open {shlex.quote(mountpoint)} </dev/null >/dev/null 2>&1 &"
+        try:
+            await asyncio.create_subprocess_shell(
+                launcher, env=self._session_env(), start_new_session=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("xdg-open usb falló: %r", exc)
+
+        return CommandResult(True, f"«{label}» está montado en {mountpoint}", "",
+                             0, time.time() - start, "udisksctl")
+
+    # Plantillas de arranque para "crea un archivo X.html" (Ri las escribe sin
+    # pasar por el shell; el LLM no necesita generar cientos de líneas).
+    _CODE_TEMPLATES = {
+        "html": """<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>%TITLE%</title>
+  <style>
+    :root { --acento: #2dd4bf; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f172a;
+           color: #e2e8f0; display: grid; place-items: center; min-height: 100vh; }
+    .tarjeta { background: #1e293b; padding: 2rem 3rem; border-radius: 1rem;
+               box-shadow: 0 10px 30px rgba(0,0,0,.4); text-align: center; }
+    button { margin-top: 1rem; padding: .6rem 1.4rem; border: 0; border-radius: .6rem;
+             background: var(--acento); color: #04222b; font-weight: 700; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <main class="tarjeta">
+    <h1>%TITLE%</h1>
+    <p style="margin-top:.5rem">Página inicial creada por Ri</p>
+    <button onclick="saludar()">Púlsame</button>
+  </main>
+  <script>
+    function saludar() {
+      alert('¡Hola desde %TITLE%!');
+    }
+  </script>
+</body>
+</html>
+""",
+        "py": '"""%TITLE% · creado por Ri."""\n\n\ndef main():\n    print("Hola desde %TITLE%")\n\n\nif __name__ == "__main__":\n    main()\n',
+        "js": "// %TITLE% · creado por Ri\n'use strict';\n\nfunction main() {\n  console.log('Hola desde %TITLE%');\n}\n\nmain();\n",
+        "css": "/* %TITLE% · creado por Ri */\n:root {\n  --acento: #2dd4bf;\n}\n\n* { box-sizing: border-box; margin: 0; padding: 0; }\n\nbody {\n  font-family: system-ui, sans-serif;\n}\n",
+        "json": '{\n  "nombre": "%TITLE%",\n  "elementos": []\n}\n',
+        "md": "# %TITLE%\n\nCreado por Ri.\n",
+        "sh": "#!/usr/bin/env bash\n# %TITLE% · creado por Ri\nset -euo pipefail\n\necho \"Hola desde %TITLE%\"\n",
+    }
+
+    async def create_code_file(self, name: str) -> CommandResult:
+        """Crea un archivo de código con plantilla en ~/Documents/cilix y lo abre."""
+        start = time.time()
+        safe = re.sub(r"[^A-Za-z0-9._-]", "", (name or "").strip())
+        if "." not in safe or safe.startswith("."):
+            return CommandResult(False, "", "Nombre de archivo no válido", 1,
+                                 time.time() - start, name)
+        stem, _, ext = safe.rpartition(".")
+        ext = ext.lower()
+        base = os.path.expanduser("~/Documents/cilix")
+        try:
+            os.makedirs(base, exist_ok=True)
+            path = os.path.join(base, f"{stem}.{ext}")
+            n = 1
+            while os.path.exists(path):              # nunca sobrescribir
+                n += 1
+                path = os.path.join(base, f"{stem}-{n}.{ext}")
+            plantilla = self._CODE_TEMPLATES.get(ext) or "// %TITLE% · creado por Ri\n"
+            contenido = plantilla.replace("%TITLE%", stem)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(contenido)
+            lineas = contenido.count("\n") + (0 if contenido.endswith("\n") else 1)
+            # Abrirlo con la app por defecto (navegador/editor) de la sesión gráfica
+            launcher = f"setsid xdg-open {shlex.quote(path)} </dev/null >/dev/null 2>&1 &"
+            try:
+                await asyncio.create_subprocess_shell(
+                    launcher, env=self._session_env(), start_new_session=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("xdg-open archivo falló: %r", exc)
+            return CommandResult(True,
+                                 f"{path} · {lineas} líneas (plantilla lista para editar)",
+                                 "", 0, time.time() - start, "writefile")
+        except Exception as exc:  # noqa: BLE001
+            return CommandResult(False, "", f"No pude escribir el archivo: {exc}",
+                                 1, time.time() - start, "writefile")
 
     # ── Ejecución principal ────────────────────────────────────────────────
     async def execute_safe_command(
@@ -324,9 +511,17 @@ class OSController:
             cmd = f"gtk-launch {shlex.quote(app_name)}" + (
                 " " + " ".join(shlex.quote(a) for a in args) if args else "")
         else:
-            return CommandResult(False, "",
-                                 f"Aplicación no encontrada: {app_name}",
-                                 1, time.time() - start, app_name)
+            # 3er intento: app Flatpak (ej. 'leocad' → org.leocad.LeoCAD); no
+            # están en PATH y su .desktop vive en exports, así que se busca
+            # por id o nombre entre las apps instaladas.
+            flat_id = await self._flatpak_app_id(app_name)
+            if flat_id:
+                cmd = f"flatpak run {shlex.quote(flat_id)}" + (
+                    " " + " ".join(shlex.quote(a) for a in args) if args else "")
+            else:
+                return CommandResult(False, "",
+                                     f"Aplicación no encontrada: {app_name}",
+                                     1, time.time() - start, app_name)
 
         # `setsid … &` desacopla el proceso del backend (no muere al terminar).
         launcher = f"setsid {cmd} </dev/null >/dev/null 2>&1 &"

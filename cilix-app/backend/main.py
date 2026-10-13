@@ -41,7 +41,7 @@ from command_interpreter import CommandInterpreter
 from config import FRONTEND_DIR, MODELS_DIR, STATIC_DIR, log_startup_summary, settings
 from core_ia import CoreIA
 from memory import MemoryStore
-from os_controller import OSController
+from os_controller import OSController, CommandResult
 from personality_engine import PersonalityEngine
 from vista_engine import VistaEngine
 
@@ -361,6 +361,15 @@ class CilixServer:
         await self.manager.send(cid, {"type": "state", "state": "executing"})
         if intent.kind == "launch":
             result = await self.osc.launch_application(intent.app, intent.args)
+        elif intent.kind == "usb":
+            # "abre el usb" → montar y abrir en el gestor de archivos
+            result = await self.osc.mount_usb(intent.app or "")
+        elif intent.kind == "help":
+            # Catálogo de comandos: no se ejecuta nada, reply_hint es el texto
+            result = CommandResult(True, "", "", 0, 0.0, "help")
+        elif intent.kind == "writefile":
+            # "haz un código llamado i.html" → plantilla real en ~/Documents/cilix
+            result = await self.osc.create_code_file(intent.app or "")
         else:
             result = await self.osc.execute_safe_command(intent.command)
         await self.manager.send(cid, {"type": "command_result", **result.to_dict()})
@@ -585,7 +594,9 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         server.manager.disconnect(cid)
     except Exception as exc:  # noqa: BLE001
-        logger.error("❌ WS %s: %s", cid[:8], exc)
+        # Ruido habitual del cliente (recarga de pestaña, socket cerrado antes
+        # de un envío): no es un fallo del servidor, solo informativo.
+        logger.warning("WS %s cerrado: %r", cid[:8], exc)
         server.manager.disconnect(cid)
 
 
@@ -598,4 +609,9 @@ if __name__ == "__main__":
         port=settings.port,
         reload=dev,
         log_level="info" if dev else "warning",
+        # Keepalive del WS: con 8 GB y swap, un pico de CPU (TTS/Ollama) puede
+        # retrasar los pongs más de los 20 s por defecto y el servidor cortaba
+        # la conexión del frontend (1011 keepalive ping timeout). Más margen.
+        ws_ping_interval=60,
+        ws_ping_timeout=300,
     )

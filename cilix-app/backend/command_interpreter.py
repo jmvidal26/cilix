@@ -48,7 +48,7 @@ SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_\-\. ]+")
 
 @dataclass
 class Intent:
-    """Acción a ejecutar. `kind` es 'launch' (app) o 'command' (shell)."""
+    """Acción a ejecutar. `kind` es 'launch' (app), 'command' (shell) o 'usb' (montar+abrir)."""
     kind: str
     reply_hint: str = ""
     app: Optional[str] = None
@@ -72,7 +72,31 @@ class CommandInterpreter:
                 return Intent(kind="command", command=cmd, reply_hint="Ejecuté el comando.")
             return None
 
-        # 2) Lanzar aplicación:  "abre firefox", "lanza el navegador"
+        # 2) Abrir USB / pendrive: "abre el usb", "abre el usb ventoy",
+        #    "muestra el pendrive" → se monta (si hace falta) y se abre en el
+        #    gestor de archivos. Va ANTES del lanzador de apps para que
+        #    'abre el usb' no intente ejecutar un binario llamado 'usb'.
+        if re.search(r"\b(usb|pendrive|memoria extraible|ventoy)\b", low) and \
+           (re.search(LAUNCH_VERBS, low) or re.search(r"\b(que hay|muestra|abrir|contenido)\b", low)):
+            hint = "ventoy" if "ventoy" in low else ""
+            return Intent(kind="usb", app=hint,
+                          reply_hint="Conectando el USB…")
+
+        # 2b) Auto-descripción: "lista los comandos que puedes realizar",
+        #     "¿qué puedes hacer?", "ayuda" → catálogo real, sin pasar por shell.
+        if re.search(r"\b(lista|listame|muestra|dime|cuales son)\b[^.]{0,40}\b(comandos|acciones|puedes (hacer|realizar|ejecutar))\b", low) or \
+           re.search(r"\b(que|que) (puedes|sabes) (hacer|realizar)\b", low) or low in ("ayuda", "help"):
+            ayuda = ("Esto es lo que puedo hacer por ti:\n"
+                     "• Abrir apps: «abre firefox», «abre leocad», «abre la terminal»\n"
+                     "• Abrir el USB: «abre el usb»\n"
+                     "• Crear carpetas: «crea una carpeta llamada pruebas»\n"
+                     "• Listar archivos: «lista los documentos de Downloads», «lista tus carpetas»\n"
+                     "• Sistema: «uso de ram», «analiza la gpu», «que hora es», «procesos», «espacio en disco»\n"
+                     "• Comando literal: «!df -h»\n"
+                     "• Y charlar de lo que quieras conmigo 😄")
+            return Intent(kind="help", reply_hint=ayuda)
+
+        # 3) Lanzar aplicación:  "abre firefox", "lanza el navegador"
         m = re.search(rf"^\s*{LAUNCH_VERBS}\s+(?:el|la|los|las|un|una|mi)?\s*(.+?)\s*$", low)
         if m:
             target = m.group(1).strip()
@@ -88,8 +112,19 @@ class CommandInterpreter:
             return Intent(kind="command", command=f'mkdir -p ~/Documents/{name}',
                           reply_hint=f"Creé la carpeta «{name}» en Documentos.")
 
+        # 3b) Crear archivo de código: "haz un codigo llamado i.html",
+        #     "crea un archivo llamado test.py", "genera main.js" → plantilla real
+        #     en ~/Documents/cilix (el LLM de 1.5B no debe escribir 600 líneas).
+        m = re.search(r"\b(crea|crear|haz|hacer|genera|generar|escribe|escribir|necesito|quiero)\b"
+                      r"[^.]{0,40}?\b([a-z0-9_\-]+\.(?:html?|css|js|ts|py|txt|md|json|sh|c|cpp|java|rs))\b", low)
+        if m:
+            fname = m.group(2)
+            return Intent(kind="writefile", app=fname,
+                          reply_hint=f"Listo, creé «{fname}» con una plantilla inicial:")
+
         # 4) Consultas del sistema (patrones concretos para no secuestrar charla)
         sysmap = [
+            (r"\bgpu\b|grafica|aceleracion", "lspci | grep -iE 'vga|3d|display'"),
             (r"\b(que|cual es|dime).*(hora)\b", "date '+%H:%M del %d/%m/%Y'"),
             (r"\b(fecha|que dia)\b", "date"),
             (r"\b(ram|memoria)\b", "free -h"),
@@ -104,9 +139,10 @@ class CommandInterpreter:
             if re.search(pat, low):
                 return Intent(kind="command", command=cmd, reply_hint="Aquí tienes el dato del sistema.")
 
-        # 5) Listar archivos:  "lista los archivos de Descargas"
-        if re.search(r"\b(lista|muestra|ensena|enseña|dime que hay|que archivos)\b", low) and \
-           re.search(r"\b(archivos|ficheros|contenido|carpeta|directorios)\b", low):
+        # 5) Listar archivos:  "lista los archivos de Descargas", "lista tus carpetas",
+        #    "lista los documentos de Downloads" (singulares y plurales, sin acentos).
+        if re.search(r"\b(lista|listame|muestra|ensena|enseña|dime que hay|que archivos|que hay)\b", low) and \
+           re.search(r"\b(archivos?|ficheros?|contenidos?|carpetas?|directorios?|documentos?|descargas?|imagenes?|fotos?|videos?)\b", low):
             path = self._extract_path(raw)
             return Intent(kind="command", command=f"ls -la {path}",
                           reply_hint="Esto es lo que encontré.")
@@ -133,13 +169,22 @@ class CommandInterpreter:
         m = re.search(r"(?:de|en|del|desde)\s+([A-Za-z0-9_\-/\.\~ ]+)", message)
         if not m:
             return "~"
-        frag = m.group(1).strip().rstrip("?.!,")
+        frag = m.group(1).strip().rstrip("?.,!")
         known = {
             "descargas": "~/Downloads", "downloads": "~/Downloads",
             "documentos": "~/Documents", "documents": "~/Documents",
             "imagenes": "~/Pictures", "imágenes": "~/Pictures",
             "musica": "~/Music", "música": "~/Music",
             "videos": "~/Videos", "escritorio": "~/Desktop",
+            "casa": "~", "home": "~", "inicio": "~",
         }
+        # "los documentos de Downloads" → la ruta va DESPUES de 'de': Downloads.
+        # Si 'documentos' es lo que se quiere listar (sin 'de X' detrás), usa ~/Documents.
         key = _norm(frag)
-        return known.get(key, f"~/{frag}" if "/" not in frag else frag)
+        if key in known:
+            return known[key]
+        # El fragmento puede traer cola ("downloads por favor"): probar palabra a palabra.
+        for word in key.split():
+            if word in known:
+                return known[word]
+        return f"~/{frag}" if "/" not in frag else frag

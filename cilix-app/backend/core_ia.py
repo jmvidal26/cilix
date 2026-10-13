@@ -101,6 +101,11 @@ class CoreIA:
         self.conversation_history: List[Dict[str, Any]] = []
         self.max_history_length = 12   # historial corto: menos RAM y menos tokens
 
+        # ¿Hay una generación en vuelo? El guardián de RAM NO debe descargar
+        # a Ri a mitad de una respuesta (eso cortaba la conexión y producía
+        # el "problemilla técnico" aleatorio con RAM alta).
+        self.busy = 0
+
         # Cliente HTTP reutilizable hacia Ollama (una sola pila de conexión:
         # evita crear/destruir cliente y handshake en cada petición).
         self._client: Optional[httpx.AsyncClient] = None
@@ -124,7 +129,13 @@ class CoreIA:
             "Evitas listas y párrafos largos salvo que se te pidan: prioriza "
             "cercanía, personalidad y emoción. ESCUCHA DE VERDAD: recuerda y usa "
             "con naturalidad el nombre y los datos que el usuario ya te dio "
-            "(estudios, trabajo, gustos) y NUNCA le repreguntes algo que ya sabes."
+            "(estudios, trabajo, gustos) y NUNCA le repreguntes algo que ya sabes. "
+            "PROHIBIDO sonar como un call-center: no abras cada respuesta con "
+            "'¡Hola!' ni con plantillas tipo 'Estoy listo para ayudarte con X' o "
+            "'¿En qué necesitas asistencia?'. Si te preguntan algo concreto, "
+            "responde DIRECTO a eso, sin repetir la pregunta, variando el tono "
+            "como haría una amiga de verdad. NUNCA te niegues a escribir código "
+            "o crear archivos de ejemplo: es parte de tu trabajo y es seguro."
         )
         self.re_context = (
             "Eres Cilix-Re, la hermana mayor experta en programación. Enfoque: "
@@ -159,8 +170,8 @@ class CoreIA:
             logger.info("🔧 Modo dev: omitiendo verificación de Ollama")
             return True
         try:
-            client = await self._http(timeout=10.0)
-            r = await client.get(f"{self.ollama_url}/api/tags")
+            client = await self._http()
+            r = await client.get(f"{self.ollama_url}/api/tags", timeout=10.0)
             if r.status_code == 200:
                 n = len(r.json().get("models", []))
                 logger.info("📦 Ollama OK · modelos disponibles: %d", n)
@@ -171,8 +182,14 @@ class CoreIA:
             raise
 
     # ── Gestión de RAM ─────────────────────────────────────────────────────
-    async def _http(self, timeout: float = 120.0) -> httpx.AsyncClient:
-        """Devuelve el cliente httpx persistente (creándolo si hace falta)."""
+    async def _http(self, timeout: float = 300.0) -> httpx.AsyncClient:
+        """Devuelve el cliente httpx persistente (creándolo si hace falta).
+
+        OJO: el cliente se crea UNA vez con el timeout del primer llamador. Si
+        el chequeo de salud (10 s) lo creara, `generate` heredaría 10 s y toda
+        respuesta larga moriría con httpx.ReadTimeout('') — el verdadero
+        'problemilla técnico'. Por eso cada petición pasa su propio timeout.
+        """
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 timeout=timeout,
@@ -227,11 +244,12 @@ class CoreIA:
             self.re_loaded = False
             return True
         try:
-            client = await self._http(timeout=10.0)
+            client = await self._http()
             # keep_alive=0 fuerza la descarga inmediata en Ollama
             await client.post(
                 f"{self.ollama_url}/api/generate",
                 json={"model": self.re_model, "keep_alive": 0},
+                timeout=15.0,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Aviso al descargar Re: %s", exc)
@@ -244,14 +262,20 @@ class CoreIA:
         """Descarga Ri en caso de EMERGENCIA de RAM (se recarga sola luego)."""
         if not self.ri_loaded:
             return True
+        if self.busy:
+            # Ri está generando justo ahora: cortarla daría "problemilla técnico".
+            # Mejor esperar al siguiente tick del vigilante (1 s).
+            logger.warning("🚨 RAM en emergencia pero Ri generando → no la descargo")
+            return False
         if self.dev_mode:
             self.ri_loaded = False
             return True
         try:
-            client = await self._http(timeout=10.0)
+            client = await self._http()
             await client.post(
                 f"{self.ollama_url}/api/generate",
                 json={"model": self.ri_model, "keep_alive": 0},
+                timeout=15.0,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Aviso al descargar Ri: %s", exc)
@@ -269,9 +293,10 @@ class CoreIA:
         mayor y el num_ctx pequeño posterior no la reduciría.
         """
         try:
-            client = await self._http(timeout=60.0)
+            client = await self._http()
             r = await client.post(
                 f"{self.ollama_url}/api/generate",
+                timeout=90.0,
                 json={
                     "model": model, "prompt": "", "keep_alive": keep_alive,
                     "options": {
@@ -346,7 +371,9 @@ class CoreIA:
             }
 
         except Exception as exc:  # noqa: BLE001
-            logger.error("❌ Error en process_message: %s", exc)
+            # `%r` muestra el TIPO de excepción: hay errores de httpx/asyncio
+            # cuyo str() viene vacío y antes quedaban como "Error en process_message: ".
+            logger.error("❌ Error en process_message: %r", exc)
             fallback = random.choice([
                 "Uy, estoy teniendo un problemilla técnico. ¿Puedes repetirlo?",
                 "Algo no fue bien de mi lado. Intentemos de nuevo 💕",
@@ -389,10 +416,36 @@ class CoreIA:
             },
         }
         client = await self._http()
-        r = await client.post(f"{self.ollama_url}/api/generate", json=payload)
-        if r.status_code != 200:
-            raise ConnectionError(f"Ollama respondió {r.status_code}")
-        return r.json().get("response", "").strip()
+        # Un solo reintento: con RAM alta la generación puede caer (conexión
+        # cortada o lectura lenta). Tras 2 s el modelo se recalienta solo y la
+        # segunda intentona suele funcionar. OJO: el 'ReadTimeout' histórico
+        # venía del cliente httpx heredando el timeout de 10 s del chequeo de
+        # salud; ya se corrige pasando el timeout en cada petición.
+        last_exc: Optional[Exception] = None
+        self.busy += 1
+        try:
+            for attempt in (1, 2):
+                try:
+                    r = await client.post(f"{self.ollama_url}/api/generate", json=payload,
+                                          timeout=300.0)
+                    if r.status_code != 200:
+                        raise ConnectionError(f"Ollama respondió {r.status_code}")
+                    return self._clean_echo(r.json().get("response", ""))
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    logger.warning("⚠️ Ollama falló (intento %d/2): %r", attempt, exc)
+                    if attempt == 1:
+                        await asyncio.sleep(2.0)
+                        await self._warm_model(model, "2m")   # reasegurar residente
+        finally:
+            self.busy -= 1
+        raise last_exc
+
+    @staticmethod
+    def _clean_echo(text: str) -> str:
+        """Quita la etiqueta que el modelo hace eco ('Cilix-Ri:') y espacios sobrantes."""
+        text = re.sub(r"^\s*Cilix-?\s*(Ri|Re)\s*[:\-\u2013\u2014]\s*", "", text or "", flags=re.I)
+        return text.strip()
 
     def _dev_response(self, mode: AIMode) -> str:
         """Respuestas simuladas para pruebas sin Ollama."""
@@ -416,10 +469,18 @@ class CoreIA:
             "Lo que YA sabes del usuario (úsalo con naturalidad, NO lo vuelvas a preguntar):\n"
             + facts + "\n\n"
         ) if facts else ""
+        # Con un solo cerebro, Ri también programa: sin eso, a veces se niega.
+        extra = ""
+        if self._is_code_related(message):
+            extra = (
+                "\nNota: te piden código/archivos. Es tu trabajo, no es peligroso: "
+                "responde con un ejemplo breve y útil, nunca te niegues.\n"
+            )
         return (
             f"{self.ri_personality}\n\n"
             f"{self._mood_block()}"
             f"{bloque}"
+            f"{extra}"
             f"Conversación reciente:\n{ctx}\n\n"
             f"Usuario: {message}\nCilix-Ri:"
         )
