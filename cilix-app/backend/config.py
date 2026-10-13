@@ -118,13 +118,14 @@ class Settings:
         "CILIX_KOKORO_VOICES", str(MODELS_DIR / "kokoro" / "voices-v1.0.bin"))
     kokoro_voice: str = _env("CILIX_KOKORO_VOICE", "ef_dora")       # femenina es
     kokoro_lang: str = _env("CILIX_KOKORO_LANG", "es")
-    kokoro_speed: float = _env("CILIX_KOKORO_SPEED", 1.15)   # >1 = habla más rápido
+    kokoro_speed: float = _env("CILIX_KOKORO_SPEED", 1.25)  # >1 = más rápido/agudo
     # Precarga el motor de voz tras arrancar (evita el retardo de la 1ª frase).
     # Se salta si la RAM está crítica. false = carga solo al primer uso.
     voice_warmup: bool = _env("CILIX_VOICE_WARMUP", True)
-    # Tono (+semitonas) aplicado a la voz Kokoro para hacerla MAS FEMENINA
-    # (ef_dora es la única voz femenina en español del pack Kokoro 1.x).
-    kokoro_pitch: float = _env("CILIX_KOKORO_PITCH", 2.0)
+    # Tono (+semitonas, WSOLA) sobre la voz Kokoro. 0 = ef_dora NATURAL
+    # (el punto de subida se logra con CILIX_KOKORO_SPEED). Subir a 1-2
+    # si se quiere un timbre aún más agudo con duración intacta.
+    kokoro_pitch: float = _env("CILIX_KOKORO_PITCH", 0.0)
     # Hilos de ONNXRuntime para Kokoro (menos hilos = menos RAM del arena).
     ort_threads: int = _env("CILIX_ORT_THREADS", 2)
     # Segundos de inactividad tras los cuales se DESCARGAN Kokoro/Whisper de
