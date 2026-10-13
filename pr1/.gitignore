@@ -1,0 +1,20 @@
+# Sylix OS Core Assistant — .gitignore
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.onnx
+*.bin
+*.wav
+*.mp3
+models/
+logs/
+*.log
+.DS_Store
+sylix_screenshot.png
+node_modules/

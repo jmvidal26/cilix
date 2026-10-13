@@ -1,0 +1,38 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Cilix v2.0 · Dependencias 100% locales (sin APIs de pago ni nube)
+#  Entorno: Pop!_OS · límite estricto de 8 GB de RAM
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Servidor web + WebSockets ───────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+websockets>=13.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
+pydantic>=2.7.0
+
+# ── Monitoreo de recursos (guarda de RAM) ────────────────────────────────────
+psutil>=5.9.0
+
+# ── Audio: STT (Whisper) + TTS (Piper) + manipulación WAV ─────────────────────
+numpy>=1.26.0
+soundfile>=0.12.1
+sounddevice>=0.4.7
+faster-whisper>=1.0.0        # STT ligero en CPU (modelo 'tiny')
+piper-tts>=1.2.0             # TTS respaldo (ligero, offline)
+kokoro-onnx>=0.6.0           # TTS principal: voz femenina natural (ef_dora)
+
+# ── Percepción (opcional: solo si activas CILIX_VISION_ENABLED) ───────────────
+#  La detección de ventana activa usa utilidades de sistema (xdotool/wmctrl),
+#  no requieren paquete Python. OpenCV solo es necesario para presencia/cámara.
+# opencv-python>=4.9.0
+# pillow>=10.0.0
+
+# ── Notas de instalación ──────────────────────────────────────────────────────
+#  1) Crea un venv:      python3 -m venv .venv && source .venv/bin/activate
+#  2) Instala:           pip install -r requirements.txt
+#  3) Levanta Ollama:    ollama serve
+#  4) Descarga modelos:  ollama pull qwen2.5:1.5b        (Ri, <1.5 GB)
+#                        ollama pull deepseek-coder:1.3b  (Re, ~3 GB)
+#  Dependencias de sistema recomendadas:
+#      sudo apt install xdotool wmctrl libsndfile1 ffmpeg

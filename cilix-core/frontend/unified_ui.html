@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<!-- Cilix v1.2 - UI Unificada (basada en pr1) -->
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cilix Assistant v1.2 - UI Unificada</title>
+  <meta name="description" content="Agente autónomo VTuber Live2D — Cilix v1.2: sistema local 100% offline." />
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet" />
+
+  <!-- Live2D Cubism Core v4 -->
+  <script src="/static/live2dcubismcore.min.js" onerror="this.onerror=null;this.src='https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js'"></script>
+
+  <!-- Pixi.js v6 -->
+  <script src="/static/pixi.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js'"></script>
+
+  <!-- pixi-live2d-display Cubism 4 -->
+  <script src="/static/cubism4.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js'"></script>
+
+  <style>
+    /* ═══ RESET & TOKENS ═══════════════════════════════════════════════════════ */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --cyan:       #00f5ff;
+      --cyan-dark:  #00b8cc;
+      --magenta:    #ff2d78;
+      --purple:     #8b5cf6;
+      --indigo:     #4f46e5;
+      --bg:         #050a14;
+      --bg2:        #080f1e;
+      --surface:    rgba(10, 20, 40, 0.82);
+      --border:     rgba(0, 245, 255, 0.18);
+      --border-hot: rgba(0, 245, 255, 0.55);
+      --text:       #e2f0ff;
+      --text-dim:   rgba(226, 240, 255, 0.45);
+      --success:    #22d3a0;
+      --warning:    #f59e0b;
+      --error:      #ff4d6d;
+      --font-ui:    'Outfit', system-ui, sans-serif;
+      --font-mono:  'JetBrains Mono', monospace;
+      --radius:     12px;
+      --radius-sm:  7px;
+      --glow-cyan:  0 0 18px rgba(0,245,255,0.5), 0 0 40px rgba(0,245,255,0.2);
+      --glow-mg:    0 0 18px rgba(255,45,120,0.5), 0 0 40px rgba(255,45,120,0.15);
+    }
+
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      font-family: var(--font-ui);
+      color: var(--text);
+    }
+
+    /* ═══ CANVAS LIVE2D ═══════════════════════════════════════════════════════ */
+    #live2d-canvas {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      cursor: grab;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    #live2d-canvas.dragging { cursor: grabbing; }
+
+    /* ═══ FONDO ANIMADO ════════════════════════════════════════════════════════ */
+    #bg-grid {
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      background:
+        linear-gradient(to bottom, #050a14 0%, #090d1f 100%),
+        repeating-linear-gradient(0deg, transparent, transparent 59px, rgba(0,245,255,0.035) 60px),
+        repeating-linear-gradient(90deg, transparent, transparent 59px, rgba(0,245,255,0.035) 60px);
+    }
+
+    .scan-line {
+      position: fixed;
+      top: -10%;
+      left: 0;
+      width: 100%;
+      height: 4px;
+      background: linear-gradient(90deg, transparent, rgba(0,245,255,0.15) 30%, rgba(0,245,255,0.4) 50%, rgba(0,245,255,0.15) 70%, transparent);
+      animation: scan 8s linear infinite;
+      z-index: 2;
+      pointer-events: none;
+    }
+
+    @keyframes scan {
+      from { top: -5%; }
+      to   { top: 105%; }
+    }
+
+    /* ═══ HUD ════════════════════════════════════════════════════════════════════ */
+    #hud {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      pointer-events: none;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      grid-template-columns: 320px 1fr 320px;
+      gap: 14px;
+      padding: 16px;
+    }
+
+    /* ── HEADER ─────────────────────────────────────────────────────────────── */
+    #hud-header {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      pointer-events: auto;
+    }
+
+    .hud-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .hud-logo-icon {
+      width: 40px; height: 40px;
+      background: linear-gradient(135deg, var(--cyan), var(--purple));
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px;
+      box-shadow: var(--glow-cyan);
+      flex-shrink: 0;
+    }
+
+    .hud-logo-text h1 {
+      font-size: 1.1rem;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      background: linear-gradient(90deg, var(--cyan), var(--purple));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hud-logo-text span {
+      font-size: 0.65rem;
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .hud-status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 30px;
+      padding: 6px 16px;
+      backdrop-filter: blur(16px);
+    }
+
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 8px var(--success);
+      animation: pulse-dot 2s ease-in-out infinite;
+    }
+    .status-dot[data-state="thinking"]  { background: var(--cyan); }
+    .status-dot[data-state="executing"] { background: var(--warning); }
+    .status-dot[data-state="talking"]   { background: var(--magenta); }
+    .status-dot[data-state="error"]     { background: var(--error); }
+
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%       { opacity: 0.6; transform: scale(0.8); }
+    }
+
+    .hud-metrics {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .metric-chip {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 4px 12px;
+      font-family: var(--font-mono);
+      font-size: 0.65rem;
+      color: var(--text-dim);
+      backdrop-filter: blur(12px);
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .metric-chip .val { color: var(--cyan); font-weight: 700; }
+
+    /* ── PANEL IZQUIERDO ─────────────────────────────────────────────────────── */
+    #panel-left {
+      grid-row: 2;
+      grid-column: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      pointer-events: auto;
+    }
+
+    /* ── PANEL DERECHO ───────────────────────────────────────────────────────── */
+    #panel-right {
+      grid-row: 2;
+      grid-column: 3;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      pointer-events: auto;
+    }
+
+    /* ── CARD BASE ───────────────────────────────────────────────────────────── */
+    .hud-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      backdrop-filter: blur(20px);
+      transition: border-color 0.3s ease;
+    }
+    .hud-card:hover { border-color: var(--border-hot); }
+
+    .card-title {
+      font-size: 0.62rem;
+      font-weight: 700;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--cyan);
+      font-family: var(--font-mono);
+      margin-bottom: 10px;
+    }
+
+    /* ── CHAT HISTORY ─────────────────────────────────────────────────────────── */
+    #chat-history {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 300px;
+    }
+
+    .chat-bubble {
+      padding: 8px 12px;
+      border-radius: var(--radius-sm);
+      font-size: 0.72rem;
+      line-height: 1.5;
+      max-width: 95%;
+    }
+    .chat-bubble.user {
+      background: rgba(79, 70, 229, 0.18);
+      border: 1px solid rgba(79,70,229,0.35);
+      align-self: flex-end;
+      color: var(--text);
+    }
+    .chat-bubble.assistant {
+      background: rgba(0, 245, 255, 0.07);
+      border: 1px solid rgba(0,245,255,0.2);
+      align-self: flex-start;
+      color: var(--cyan);
+    }
+
+    /* ── FOOTER INPUT ─────────────────────────────────────────────────────────── */
+    #hud-footer {
+      grid-column: 1 / -1;
+      pointer-events: auto;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    #input-wrapper {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 30px;
+      padding: 8px 18px;
+      gap: 10px;
+    }
+    #input-wrapper:focus-within {
+      border-color: var(--cyan);
+      box-shadow: var(--glow-cyan);
+    }
+
+    #user-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: var(--text);
+      font-size: 0.88rem;
+    }
+
+    #mic-btn, #send-btn {
+      width: 46px; height: 46px;
+      border-radius: 50%;
+      font-size: 1.1rem;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: all 0.2s ease;
+    }
+    #mic-btn {
+      background: var(--surface);
+      border: 1px solid var(--border);
+    }
+    #mic-btn:hover { border-color: var(--magenta); box-shadow: var(--glow-mg); }
+    #mic-btn.recording { background: rgba(255,45,120,0.15); border-color: var(--magenta); }
+    #send-btn {
+      background: linear-gradient(135deg, var(--cyan), var(--indigo));
+      color: var(--bg);
+      box-shadow: var(--glow-cyan);
+    }
+    #send-btn:hover { transform: scale(1.1); }
+    #send-btn:active { transform: scale(0.95); }
+
+    /* ── CORNER DECORATORS ────────────────────────────────────────────────────── */
+    .corner-deco {
+      position: fixed;
+      width: 60px; height: 60px;
+      z-index: 9;
+      pointer-events: none;
+    }
+    .corner-deco::before, .corner-deco::after {
+      content: ''; position: absolute; background: var(--cyan); border-radius: 2px;
+    }
+    .corner-deco::before { width: 100%; height: 2px; }
+    .corner-deco::after { width: 2px; height: 100%; }
+    .corner-tl { top: 16px; left: 16px; }
+    .corner-tr { top: 16px; right: 16px; transform: scaleX(-1); }
+    .corner-bl { bottom: 16px; left: 16px; transform: scaleY(-1); }
+    .corner-br { bottom: 16px; right: 16px; transform: scale(-1, -1); }
+
+    /* ── MASCOT MODE (SOLO PERSONAJE) ────────────────────────────────────────── */
+    body.mascot-mode {
+      background: transparent !important;
+    }
+    body.mascot-mode #bg-grid,
+    body.mascot-mode .scan-line,
+    body.mascot-mode .corner-deco,
+    body.mascot-mode #hud,
+    body.mascot-mode .hud-logo-text,
+    body.mascot-mode .hud-status-bar,
+    body.mascot-mode #panel-left,
+    body.mascot-mode #panel-right {
+      display: none !important;
+    }
+    body.mascot-mode #hud { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; padding: 20px; }
+    body.mascot-mode #live2d-canvas { position: relative; inset: auto; cursor: grab; }
+
+    /* BURBUJA DE DIÁLOGO FLOTANTE */
+    #mascot-speech-bubble {
+      position: fixed;
+      max-width: 420px;
+      min-width: 220px;
+      padding: 14px 18px;
+      background: rgba(8, 16, 34, 0.92);
+      border: 1px solid var(--border-hot);
+      box-shadow: 0 12px 36px rgba(0,0,0,0.7), var(--glow-cyan);
+      border-radius: 18px 18px 18px 4px;
+      backdrop-filter: blur(20px);
+      color: #e2f0ff;
+      font-size: 0.92rem;
+      line-height: 1.48;
+      z-index: 100;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(12px) scale(0.96);
+      transition: opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1), transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    #mascot-speech-bubble.visible {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateY(0) scale(1);
+    }
+    .bubble-author {
+      font-size: 0.65rem;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      color: var(--cyan);
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .bubble-author .status-dot { width: 6px; height: 6px; }
+
+    /* CÁPSULA FLOTANTE DE CONTROL MINIMALISTA */
+    #mascot-dock {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(8, 16, 32, 0.88);
+      border: 1px solid var(--border-hot);
+      box-shadow: 0 10px 32px rgba(0,0,0,0.65), 0 0 20px rgba(0,245,255,0.18);
+      padding: 6px 12px;
+      border-radius: 36px;
+      backdrop-filter: blur(20px);
+      z-index: 101;
+      transition: all 0.25s ease;
+      pointer-events: auto;
+    }
+    #mascot-dock:hover { box-shadow: 0 12px 38px rgba(0,0,0,0.75), var(--glow-cyan); }
+    #mascot-input {
+      background: transparent;
+      border: none;
+      outline: none;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 0.88rem;
+      width: 280px;
+      padding: 6px 8px;
+    }
+    #mascot-input::placeholder { color: var(--text-dim); }
+    .dock-btn {
+      width: 36px; height: 36px;
+      border-radius: 50%;
+      border: 1px solid var(--border);
+      background: rgba(0, 245, 255, 0.08);
+      color: var(--text);
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      font-size: 0.95rem;
+      transition: all 0.2s ease;
+      flex-shrink: 0;
+    }
+    .dock-btn:hover { border-color: var(--cyan); background: rgba(0,245,255,0.2); transform: scale(1.08); }
+    .dock-btn.recording { border-color: var(--magenta); background: rgba(255,45,120,0.3); }
+    .dock-btn-send { background: linear-gradient(135deg, var(--cyan), var(--purple)); border: none; color: #050a14; font-weight: 700; }
+    .dock-divider { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+    .dock-hint {
+      position: absolute;
+      bottom: calc(100% + 8px);
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 0.65rem;
+      font-family: var(--font-mono);
+      color: var(--text-dim);
+      white-space: nowrap;
+      pointer-events: none;
+      background: rgba(5,10,20,0.75);
+      padding: 3px 10px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      opacity: 0.7;
+    }
+
+    /* SCROLLBAR */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(0,245,255,0.2); border-radius: 4px; }
+
+    /* RESPONSIVE */
+    @media (max-width: 900px) {
+      #hud { grid-template-columns: 1fr; grid-template-rows: auto 1fr auto; }
+      #panel-left, #panel-right { display: none; }
+      #mascot-input { width: 180px; }
+    }
+  </style>
+</head>
+<body class="mascot-mode">
+
+<!-- Fondo -->
+<div id="bg-grid"></div>
+<div class="scan-line"></div>
+
+<!-- Canvas Live2D -->
+<canvas id="live2d-canvas"></canvas>
+
+<!-- BURBUJA DE DIÁLOGO FLOTANTE -->
+<div id="mascot-speech-bubble">
+  <div class="bubble-author">
+    <span class="status-dot" id="bubble-status-dot" data-state="idle"></span>
+    <span id="bubble-author-text">Cilix</span>
+  </div>
+  <div id="bubble-text">¡Hola! Soy Cilix. Arrástrame para moverme o háblame por voz.</div>
+</div>
+
+<!-- CÁPSULA FLOTANTE DE CONTROL -->
+<div id="mascot-dock">
+  <div class="dock-hint">Arrastra para mover · Rueda para tamaño</div>
+  <button id="mascot-mic-btn" class="dock-btn" onclick="toggleMic()" title="Hablar por voz">
+    🎙️
+  </button>
+  <input type="text" id="mascot-input" placeholder="Escribe un comando..." />
+  <button id="mascot-send-btn" class="dock-btn dock-btn-send" onclick="sendMascotMessage()" title="Enviar">
+    ➤
+  </button>
+  <div class="dock-divider"></div>
+  <button class="dock-btn" onclick="resetModelPosition()" title="Centrar personaje">
+    ⌖
+  </button>
+  <button id="mascot-toggle-btn" class="dock-btn" onclick="toggleMascotMode()" title="Alternar HUD/Solo Personaje">
+    🖥️
+  </button>
+</div>
+
+<!-- Esquinas decorativas -->
+<div class="corner-deco corner-tl"></div>
+<div class="corner-deco corner-tr"></div>
+<div class="corner-deco corner-bl"></div>
+<div class="corner-deco corner-br"></div>
+
+<!-- ═══ HUD ═══════════════════════════════════════════════════════════════════ -->
+<div id="hud">
+  <!-- HEADER -->
+  <header id="hud-header">
+    <div class="hud-logo">
+      <div class="hud-logo-icon">⬡</div>
+      <div class="hud-logo-text">
+        <h1>CILIX v1.2</h1>
+        <span>Assistant · Local AI</span>
+      </div>
+    </div>
+
+    <div class="hud-status-bar">
+      <div class="status-dot" id="status-dot" data-state="idle"></div>
+      <span id="status-label">IDLE</span>
+    </div>
+
+    <div class="hud-metrics">
+      <div class="metric-chip">
+        <span>🧠</span> <span class="val" id="backend-label">Ollama</span>
+      </div>
+      <div class="metric-chip">
+        <span>💾</span> <span class="val" id="mem-label">--%</span>
+      </div>
+      <div class="metric-chip">
+        <span>🔊</span> <span class="val" id="voice-label">--</span>
+      </div>
+      <button class="metric-chip" id="toggle-mode-btn" onclick="toggleMascotMode()" style="cursor:pointer;">
+        🎭 Solo Personaje
+      </button>
+    </div>
+  </header>
+
+  <!-- PANEL IZQUIERDO -->
+  <aside id="panel-left">
+    <div class="hud-card" style="flex:1; display:flex; flex-direction:column;">
+      <div class="card-title">Conversation</div>
+      <div id="chat-history">
+        <div class="chat-bubble assistant">
+          <div style="font-size:0.6rem; font-family:var(--font-mono); color:var(--cyan); margin-bottom:3px;">Cilix</div>
+          Sistema activo. ¿Qué necesitas?
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- PANEL DERECHO (vacío en modo mascot) -->
+  <aside id="panel-right"></aside>
+
+  <!-- FOOTER INPUT -->
+  <footer id="hud-footer">
+    <button id="mic-btn" onclick="toggleMic()" title="Micrófono">🎙️</button>
+    <div id="input-wrapper">
+      <input type="text" id="user-input" placeholder="Escribe tu mensaje..." />
+      <button id="send-btn" onclick="sendMessage()" title="Enviar">➤</button>
+    </div>
+  </footer>
+</div>
+
+<!-- Scripts -->
+<script src="unified_renderer.js"></script>
+<script>
+  console.log('Cilix v1.2 - UI Unificada cargada');
+</script>
+</body>
+</html>

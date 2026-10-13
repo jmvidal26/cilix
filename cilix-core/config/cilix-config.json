@@ -1,0 +1,33 @@
+{
+  "version": "1.2-unified",
+  "project": "Cilix v1.2 con pr1 (Sylix OS Core)",
+  "sylix": {
+    "prompt_enabled": true,
+    "memory_enabled": true,
+    "activity_enabled": false,
+    "proactive_enabled": false,
+    "terminal_enabled": true,
+    "system_monitor_enabled": true
+  },
+  "memory": {
+    "database": "~/.config/sylix/memory.db",
+    "auto_save": true,
+    "retention_days": 30
+  },
+  "activity": {
+    "database": "~/.config/sylix/activity.db",
+    "enabled": false,
+    "log_level": "INFO"
+  },
+  "proactive": {
+    "database": "~/.config/sylix/proactive.db",
+    "enabled": false,
+    "suggest_optimizations": true
+  },
+  "terminal": {
+    "font_size": 14,
+    "auto_complete": true,
+    "syntax_highlighting": true,
+    "max_history": 1000
+  }
+}

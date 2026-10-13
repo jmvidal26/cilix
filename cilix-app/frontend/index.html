@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cilix · Asistente de escritorio</title>
+
+  <!-- Librerías Live2D servidas por el backend (100% locales) -->
+  <script src="/static/live2dcubismcore.min.js"></script>
+  <script src="/static/pixi.min.js"></script>
+  <script src="/static/cubism4.min.js"></script>
+
+  <link rel="stylesheet" href="/app/css/styles.css" />
+</head>
+<body>
+  <!-- ═══ Contenedor del avatar VTuber (Live2D) ═══ -->
+  <canvas id="live2d-canvas"></canvas>
+  <div id="avatar-fallback" class="avatar-fallback hidden">
+    <div class="orb"></div>
+    <span id="fallback-label">Cilix</span>
+  </div>
+
+  <!-- ═══ Barra superior arrastrable + controles de ventana ═══ -->
+  <header id="titlebar" class="titlebar">
+    <div class="brand">
+      <span class="dot" id="status-dot"></span>
+      <span class="name">Cilix</span>
+      <span class="mode-badge" id="mode-badge">Ri</span>
+    </div>
+    <div class="win-controls">
+      <button id="btn-pin" class="ico" title="Fijar arriba">📌</button>
+      <button id="btn-min" class="ico" title="Minimizar">–</button>
+      <button id="btn-close" class="ico" title="Ocultar">✕</button>
+    </div>
+  </header>
+
+  <!-- ═══ Chat flotante minimalista ═══ -->
+  <main id="chat" class="chat">
+    <div id="messages" class="messages" aria-live="polite"></div>
+
+    <!-- Indicador de estado (pensando / hablando / escuchando) -->
+    <div id="thinking" class="thinking hidden">
+      <span></span><span></span><span></span>
+    </div>
+  </main>
+
+  <!-- ═══ Barra de entrada ═══ -->
+  <footer class="composer">
+    <button id="btn-mic" class="mic" title="Hablar (STT)">🎙️</button>
+    <input id="input" class="input" type="text"
+           placeholder="Escribe, habla, o pide: «abre firefox», «crea una carpeta», «!uptime»…" autocomplete="off" />
+    <button id="btn-send" class="send" title="Enviar">➤</button>
+  </footer>
+
+  <!-- ═══ Panel de control (modo, voz, estado sistema) ═══ -->
+  <aside id="panel" class="panel">
+    <div class="row">
+      <span class="label">Cerebro</span>
+      <div class="switch" id="mode-switch">
+        <button data-mode="Ri" class="active">Ri</button>
+        <button data-mode="Re">Re</button>
+      </div>
+    </div>
+    <div class="row">
+      <span class="label">Voz</span>
+      <button id="voice-toggle" class="toggle on">ON</button>
+    </div>
+    <div class="stats">
+      <div class="chip"><b>RAM</b> <span id="ram-val">–</span></div>
+      <div class="chip"><b>CPU</b> <span id="cpu-val">–</span></div>
+      <div class="chip"><b>Ri</b> <span id="ri-val">–</span></div>
+      <div class="chip"><b>Re</b> <span id="re-val">–</span></div>
+    </div>
+  </aside>
+
+  <!-- Lógica de la interfaz -->
+  <script src="/app/js/live2d.js"></script>
+  <script src="/app/js/app.js"></script>
+</body>
+</html>

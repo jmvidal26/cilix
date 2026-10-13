@@ -1,0 +1,18 @@
+# ── Entorno / dependencias ──
+.venv/
+node_modules/
+__pycache__/
+*.py[cod]
+dist/
+
+# ── Configuración local y logs ──
+.env
+*.log
+logs/
+
+# ── Datos de usuario ──
+~/.config/cilix/
+
+# ── Sistema ──
+.DS_Store
+Thumbs.db

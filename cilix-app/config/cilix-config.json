@@ -1,0 +1,35 @@
+{
+  "version": "2.0-unified",
+  "project": "Cilix — fusión pr1 (interfaz VTuber) + cilix-core (cerebro dual local)",
+  "runtime": {
+    "mode": "local_offline",
+    "cloud_apis": false,
+    "ram_limit_gb": 8.0
+  },
+  "dual_brain": {
+    "ri": { "model": "qwen2.5:1.5b", "role": "hermana_menor", "resident": true, "est_ram_gb": 1.5 },
+    "re": { "model": "deepseek-coder:1.3b", "role": "hermana_mayor_codigo", "on_demand": true, "est_ram_gb": 3.0 }
+  },
+  "voice": {
+    "stt": { "engine": "faster-whisper", "model": "tiny", "language": "es" },
+    "tts": { "engine": "piper", "voice": "es_ES-sharvard-medium", "gender": "female" },
+    "lipsync": { "enabled": true, "fps": 25 }
+  },
+  "features": {
+    "chat_enabled": true,
+    "voice_enabled": true,
+    "vision_enabled": false,
+    "memory_enabled": true,
+    "os_commands_enabled": true
+  },
+  "ui": {
+    "overlay": "transparent_floating",
+    "always_on_top": true,
+    "theme": "dark_glass"
+  },
+  "memory": {
+    "database": "~/.config/cilix/memory.db",
+    "auto_save": true,
+    "retention_days": 30
+  }
+}

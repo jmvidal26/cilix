@@ -1,0 +1,98 @@
+{
+  "name": "sylix-os-core-assistant",
+  "version": "1.0.0",
+  "description": "Sylix OS Core Assistant - VTuber Agent with Linux Desktop Automation",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "NODE_ENV=development electron .",
+    "build-linux": "electron-builder --linux",
+    "build-deb": "electron-builder --linux deb",
+    "build-appimage": "electron-builder --linux AppImage",
+    "build-rpm": "electron-builder --linux rpm",
+    "build-all": "electron-builder --linux",
+    "package": "electron-packager . --out=dist --overwrite --platform=linux --arch=x64",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "keywords": [
+    "vtuber",
+    "ai-assistant",
+    "linux-automation",
+    "desktop-automation",
+    "bash-scripting",
+    "system-monitoring"
+  ],
+  "author": "Sylix OS Team",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1",
+    "electron-packager": "^17.1.2"
+  },
+  "dependencies": {
+    "electron-log": "^5.0.0",
+    "electron-store": "^8.1.0",
+    "node-pty": "^1.0.0",
+    "ws": "^8.16.0",
+    "xterm": "^5.3.0",
+    "xterm-addon-fit": "^0.8.0",
+    "xterm-addon-web-links": "^0.9.0",
+    "systeminformation": "^5.21.0",
+    "ps-list": "^8.1.0"
+  },
+  "build": {
+    "appId": "com.sylix.os.core",
+    "productName": "Sylix OS Core Assistant",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "**/*",
+      "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}",
+      "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}",
+      "!**/node_modules/*.d.ts",
+      "!**/*.{iml,o,hprof,orig,pyc,pyo,rbc,swp,csproj,sln,xproj}",
+      "!.editorconfig",
+      "!**/._*",
+      "!**/{.DS_Store,.git,.hg,.svn,CVS,RCS,SCCS,.gitignore,.gitattributes}",
+      "!**/{__pycache__,thumbs.db,.flowconfig,.idea,.vs,.nyc_output}",
+      "!**/{appveyor.yml,.travis.yml,circle.yml}",
+      "!**/{npm-debug.log,yarn.lock,.yarn-integrity,.yarn-metadata.json}"
+    ],
+    "linux": {
+      "target": [
+        "deb",
+        "rpm",
+        "AppImage",
+        "snap"
+      ],
+      "icon": "assets/icon.png",
+      "category": "System",
+      "maintainer": "Sylix OS Team <sylix@example.com>",
+      "description": "VTuber Agent with Linux Desktop Automation and System Control",
+      "synopsis": "AI-powered VTuber assistant with full Linux system control"
+    },
+    "deb": {
+      "depends": [
+        "python3",
+        "python3-venv",
+        "xdotool",
+        "wmctrl",
+        "nmap",
+        "ffmpeg"
+      ]
+    },
+    "extraResources": [
+      {
+        "from": "python",
+        "to": "python",
+        "filter": ["**/*"]
+      }
+    ],
+    "publish": {
+      "provider": "github",
+      "owner": "sylix-team",
+      "repo": "sylix-os-core"
+    }
+  }
+}
