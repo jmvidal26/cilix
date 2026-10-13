@@ -341,8 +341,10 @@ class OSController:
         "sh": "#!/usr/bin/env bash\n# %TITLE% · creado por Ri\nset -euo pipefail\n\necho \"Hola desde %TITLE%\"\n",
     }
 
-    async def create_code_file(self, name: str) -> CommandResult:
-        """Crea un archivo de código con plantilla en ~/Documents/cilix y lo abre."""
+    async def create_code_file(self, name: str, lines: int = 0) -> CommandResult:
+        """Crea un archivo de código con plantilla en ~/Documents/cilix y lo abre.
+        Si `lines` supera la plantilla, la rellena con bloques de comentario
+        válidos para el lenguaje (así "que tenga 300 líneas" es literal)."""
         start = time.time()
         safe = re.sub(r"[^A-Za-z0-9._-]", "", (name or "").strip())
         if "." not in safe or safe.startswith("."):
@@ -360,6 +362,19 @@ class OSController:
                 path = os.path.join(base, f"{stem}-{n}.{ext}")
             plantilla = self._CODE_TEMPLATES.get(ext) or "// %TITLE% · creado por Ri\n"
             contenido = plantilla.replace("%TITLE%", stem)
+            # Rellenar hasta el número de líneas pedido (tope 500, no saturar RAM).
+            target = max(0, min(int(lines or 0), 500))
+            if ext not in ("json", "") and target > contenido.count("\n") + 1:
+                if ext in ("py", "sh"):
+                    _fmt = "# Bloque {i} de {t} · añade aquí tu código\n"
+                elif ext in ("html", "md"):
+                    _fmt = "<!-- Bloque {i} de {t} · añade aquí tu contenido -->\n"
+                elif ext == "txt":
+                    _fmt = "Bloque {i} de {t}\n"
+                else:
+                    _fmt = "// Bloque {i} de {t} · añade aquí tu código\n"
+                while contenido.count("\n") + 1 < target:
+                    contenido += _fmt.format(i=contenido.count("\n") + 1, t=target)
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(contenido)
             lineas = contenido.count("\n") + (0 if contenido.endswith("\n") else 1)

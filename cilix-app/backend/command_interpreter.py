@@ -45,6 +45,14 @@ APP_SYNONYMS = {
 LAUNCH_VERBS = r"(?:abre|abrir|abreme|lanza|lanzar|ejecuta|ejecutar|inicia|iniciar|arranca|arrancar|levanta|levanta|corre|correr|activa|activar)"
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_\-\. ]+")
 
+# Lenguajes → extensión de archivo (para "un archivo de python llamado pedro")
+LANG_EXTS = {
+    "python": "py", "py": "py", "javascript": "js", "js": "js",
+    "typescript": "ts", "ts": "ts", "html": "html", "css": "css",
+    "bash": "sh", "shell": "sh", "java": "java", "rust": "rs",
+    "json": "json", "markdown": "md", "texto": "txt", "txt": "txt",
+}
+
 
 @dataclass
 class Intent:
@@ -117,10 +125,28 @@ class CommandInterpreter:
         #     en ~/Documents/cilix (el LLM de 1.5B no debe escribir 600 líneas).
         m = re.search(r"\b(crea|crear|haz|hacer|genera|generar|escribe|escribir|necesito|quiero)\b"
                       r"[^.]{0,40}?\b([a-z0-9_\-]+\.(?:html?|css|js|ts|py|txt|md|json|sh|c|cpp|java|rs))\b", low)
+        if not m:
+            # 3c) Sin extensión, por nombre de lenguaje: "crea un archivo de python
+            #     llamado pedro y que tenga 300 lineas" → pedro.py (300 líneas).
+            m = re.search(
+                r"\b(crea|crear|haz|hacer|genera|generar|escribe|escribir|necesito|quiero)\b"
+                r"[^.]*\b(archivo|fichero|codigo|programa|script)\b[^.]*?"
+                r"\b(?:de|en)\s*(python|javascript|typescript|html|css|bash|shell|java|rust|json|markdown|texto|py|js|ts|txt)\b"
+                r"(?:[^.]*?(?:llamado|llamada|de nombre|denominado|que se llame)\s+([a-z0-9_\-]+))?", low)
+            if m:
+                lang = m.group(3)
+                name = (m.group(4) or "codigo").strip("-_.")
+                fname = f"{name}.{LANG_EXTS.get(lang, 'txt')}"
         if m:
-            fname = m.group(2)
-            return Intent(kind="writefile", app=fname,
-                          reply_hint=f"Listo, creé «{fname}» con una plantilla inicial:")
+            fname = m.group(2) if "." in (m.group(2) or "") else fname
+            mlines = re.search(r"\b(\d{1,4})\s*lineas?\b", low)
+            nlines = int(mlines.group(1)) if mlines else 0
+            hint = (f"Listo, creé «{fname}»"
+                    + (f" con {nlines} líneas:" if nlines else " con una plantilla inicial:"))
+            intent = Intent(kind="writefile", app=fname, reply_hint=hint)
+            if nlines:
+                intent.args = [str(nlines)]
+            return intent
 
         # 4) Consultas del sistema (patrones concretos para no secuestrar charla)
         sysmap = [

@@ -369,7 +369,8 @@ class CilixServer:
             result = CommandResult(True, "", "", 0, 0.0, "help")
         elif intent.kind == "writefile":
             # "haz un código llamado i.html" → plantilla real en ~/Documents/cilix
-            result = await self.osc.create_code_file(intent.app or "")
+            nlines = int(intent.args[0]) if intent.args else 0
+            result = await self.osc.create_code_file(intent.app or "", lines=nlines)
         else:
             result = await self.osc.execute_safe_command(intent.command)
         await self.manager.send(cid, {"type": "command_result", **result.to_dict()})
