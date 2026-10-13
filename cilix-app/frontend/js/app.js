@@ -21,6 +21,8 @@
     modeSwitch: $('mode-switch'), voiceToggle: $('voice-toggle'),
     ram: $('ram-val'), cpu: $('cpu-val'), ri: $('ri-val'), re: $('re-val'),
     pin: $('btn-pin'), min: $('btn-min'), close: $('btn-close'),
+    chat: $('btn-chat'), newchat: $('btn-newchat'),
+    proactiveToggle: $('proactive-toggle'), mood: $('mood-chip'),
   };
 
   const state = {
@@ -31,6 +33,10 @@
     currentAudio: null,
     recording: false,
     mediaStop: null,
+    proactiveEnabled: true,
+    audioUnlocked: false,   // primer clic → el navegador permite reproducir
+    pendingSpeech: null,    // audio bloqueado por autoplay, awaiting gesture
+    speechRetryTs: 0,       // anti-bucle de reintento de reproducción
   };
 
   // ══ WebSocket ═══════════════════════════════════════════════════════════
@@ -51,8 +57,19 @@
     state.ws.onopen = () => {
       setOnline(true);
       console.info('[WS] conectado');
+      // Ping periódico: evita que el socket se caiga mientras Ri "piensa"
+      // (respuestas de 50-70 s con RAM alta → el 'speak' llegaba a un socket muerto).
+      state.pingTimer = setInterval(() => {
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+          state.ws.send(JSON.stringify({ type: 'ping' }));
+        }
+      }, 25000);
     };
-    state.ws.onclose = () => { setOnline(false); scheduleReconnect(); };
+    state.ws.onclose = () => {
+      setOnline(false);
+      clearInterval(state.pingTimer);
+      scheduleReconnect();
+    };
     state.ws.onerror = () => { /* onclose gestiona la reconexión */ };
     state.ws.onmessage = (ev) => handleMessage(JSON.parse(ev.data));
   }
@@ -78,6 +95,8 @@
       case 'connected':
         if (msg.config) applyConfig(msg.config);
         if (msg.status) updateStatus(msg.status);
+        // Restaurar la conversación previa (memoria persistente entre sesiones).
+        if (Array.isArray(msg.history)) renderHistory(msg.history);
         addMessage('sys', msg.message || 'Conectada 💕');
         break;
 
@@ -89,6 +108,14 @@
         setState('idle');
         addMessage('ai', msg.text, msg.mode);
         if (window.CilixAvatar) window.CilixAvatar.setEmotion(msg.emotion || 'neutral');
+        break;
+
+      case 'proactive':
+        // Ri habla sola: globo especial + emoción (el audio llega aparte por 'speak').
+        setState('idle');
+        addProactiveMessage(msg.text);
+        if (window.CilixAvatar) window.CilixAvatar.setEmotion(msg.emotion || 'neutral');
+        if (msg.mood) renderMood(msg.mood);
         break;
 
       case 'speak':
@@ -108,9 +135,25 @@
         addMessage('sys', formatCommandResult(msg));
         break;
 
+      case 'history':
+        renderHistory(msg.messages);
+        addMessage('sys', '🗂️ Historial cargado.');
+        break;
+
+      case 'new_chat_started':
+        els.messages.innerHTML = '';
+        addMessage('sys', '✨ Chat nuevo. Ri sigue recordando lo que sabe de ti.');
+        break;
+
       case 'settings_updated':
-        state.voiceEnabled = !!msg.voice_enabled;
-        updateVoiceToggle();
+        if (typeof msg.voice_enabled === 'boolean') {
+          state.voiceEnabled = msg.voice_enabled;
+          updateVoiceToggle();
+        }
+        if (typeof msg.proactive_enabled === 'boolean') {
+          state.proactiveEnabled = msg.proactive_enabled;
+          updateProactiveToggle();
+        }
         break;
 
       case 'status':
@@ -151,6 +194,47 @@
     while (els.messages.children.length > 120) els.messages.removeChild(els.messages.firstChild);
   }
 
+  /* Vuelve a pintar un listado de mensajes persistidos (role: user/assistant). */
+  function renderHistory(messages) {
+    if (!Array.isArray(messages)) return;
+    els.messages.innerHTML = '';
+    for (const m of messages) {
+      if (m.role === 'user') addMessage('user', m.content);
+      else if (m.role === 'assistant') addMessage('ai', m.content, m.mode);
+    }
+    els.messages.scrollTop = els.messages.scrollHeight;
+  }
+
+  /* Comentario espontáneo de Ri (pensamiento proactivo) → globo distintivo. */
+  function addProactiveMessage(text) {
+    const div = document.createElement('div');
+    div.className = 'msg ai proactive';
+    const tag = document.createElement('span');
+    tag.className = 'tag';
+    tag.textContent = '💭 Cilix-Ri';
+    div.appendChild(tag);
+    div.appendChild(document.createElement('br'));
+    div.appendChild(document.createTextNode(text));
+    els.messages.appendChild(div);
+    els.messages.scrollTop = els.messages.scrollHeight;
+    while (els.messages.children.length > 120) els.messages.removeChild(els.messages.firstChild);
+  }
+
+  /* Pinta el ánimo de Ri como un emoji compacto en el chip del panel. */
+  function renderMood(mood) {
+    if (!mood || !els.mood) return;
+    const v = mood.valence || 0, e = mood.energy || 0, s = mood.sociability || 0;
+    let emoji = '😌';
+    if (v > 0.4 && e > 0) emoji = '😄';
+    else if (v > 0.15) emoji = '🙂';
+    else if (v < -0.4) emoji = '😔';
+    else if (v < -0.15) emoji = '😕';
+    else if (e < -0.2) emoji = '🥱';
+    else if (s > 0.6) emoji = '🗣️';
+    els.mood.textContent = emoji;
+    els.mood.title = `Ánimo ${v.toFixed(2)} · Energía ${e.toFixed(2)} · Sociab. ${s.toFixed(2)}`;
+  }
+
   function setState(s) {
     document.body.classList.toggle('thinking', s === 'thinking');
     document.body.classList.toggle('speaking', s === 'talking');
@@ -168,8 +252,43 @@
   }
 
   // ══ Voz: reproducción TTS + lip-sync ══════════════════════════════════════
+  // Desbloquea el audio con un gesto del usuario (política de autoplay de los
+  // navegadores): al primer clic/toc reproduce un WAV mudo y marca el overlay.
+  function unlockAudio() {
+    if (state.audioUnlocked) return;
+    try {
+      const bytes = Uint8Array.from(atob(
+        'UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA='),
+        (c) => c.charCodeAt(0));
+      const a = new Audio(URL.createObjectURL(
+        new Blob([bytes], { type: 'audio/wav' })));
+      a.onended = () => {
+        state.audioUnlocked = true;
+        const ov = document.getElementById('voice-unlock');
+        if (ov) ov.style.display = 'none';
+        // Si había una frase bloqueada en espera, suena ahora (dentro del
+        // gesto del clic, con el origen ya desbloqueado).
+        if (state.pendingSpeech) {
+          const p = state.pendingSpeech; state.pendingSpeech = null;
+          playSpeech(p);
+        }
+      };
+      a.play().catch(() => {});
+    } catch (_) { /* sin audio disponible */ }
+  }
+
+  // Guarda la frase para reproducirla al siguiente clic si el navegador la bloqueó.
+  function holdSpeechForGesture(msg) {
+    state.pendingSpeech = msg;
+    state.speechRetryTs = Date.now();
+    const ov = document.getElementById('voice-unlock');
+    if (ov) ov.style.display = 'flex';
+  }
+
   function playSpeech(msg) {
     if (!msg.audio) { setState('idle'); return; }
+    // Si hace poco intentamos hablar y sigue sin desbloquearse, no reintentar
+    // en cada mensaje: esperar al gesto.
     try {
       const bytes = Uint8Array.from(atob(msg.audio), (c) => c.charCodeAt(0));
       const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
@@ -189,7 +308,19 @@
         if (window.CilixAvatar) window.CilixAvatar.setMouth(0);
       };
       audio.onerror = () => setState('idle');
-      audio.play().catch(() => setState('idle'));
+      audio.play()
+        .then(() => {
+          const ov = document.getElementById('voice-unlock');
+          if (ov) ov.style.display = 'none';
+        })
+        .catch((err) => {
+          console.warn('[TTS] reproducción bloqueada por el navegador:', err && err.name);
+          setState('idle');
+          if (err && err.name === 'NotAllowedError') {
+            holdSpeechForGesture(msg);
+            document.addEventListener('pointerdown', unlockAudio, { once: true });
+          }
+        });
     } catch (err) {
       console.error('[TTS] error reproduciendo:', err);
       setState('idle');
@@ -295,12 +426,21 @@
     els.re.textContent = s.re_loaded ? 'RAM' : 'off';
     els.ram.parentElement.classList.toggle('warn', (s.ram_percent || 0) > 85);
     if (s.mode) setMode(s.mode);
+    if (s.mood) renderMood(s.mood);
+    if (typeof s.proactive === 'boolean') {
+      state.proactiveEnabled = s.proactive;
+      updateProactiveToggle();
+    }
   }
 
   function applyConfig(cfg) {
     if (typeof cfg.voice_enabled === 'boolean') {
       state.voiceEnabled = cfg.voice_enabled;
       updateVoiceToggle();
+    }
+    if (typeof cfg.proactive_enabled === 'boolean') {
+      state.proactiveEnabled = cfg.proactive_enabled;
+      updateProactiveToggle();
     }
     // Cerebro único (dual_brain=false): ocultar el selector Ri/Re y el chip de Re.
     if (cfg.dual_brain === false) {
@@ -326,6 +466,12 @@
     els.voiceToggle.textContent = state.voiceEnabled ? 'ON' : 'OFF';
   }
 
+  function updateProactiveToggle() {
+    if (!els.proactiveToggle) return;
+    els.proactiveToggle.classList.toggle('on', state.proactiveEnabled);
+    els.proactiveToggle.textContent = state.proactiveEnabled ? 'ON' : 'OFF';
+  }
+
   function bindEvents() {
     els.send.addEventListener('click', submitText);
     els.input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitText(); });
@@ -342,6 +488,18 @@
       updateVoiceToggle();
     });
 
+    // Acceso a chats: ver historial / abrir chat nuevo
+    if (els.chat) els.chat.addEventListener('click', () => send({ type: 'history' }));
+    if (els.newchat) els.newchat.addEventListener('click', () => send({ type: 'new_chat' }));
+
+    // Toggle de personalidad proactiva
+    if (els.proactiveToggle) els.proactiveToggle.addEventListener('click', () => {
+      const next = !state.proactiveEnabled;
+      send({ type: 'toggle_proactive', enabled: next });
+      state.proactiveEnabled = next;
+      updateProactiveToggle();
+    });
+
     // Controles de ventana (solo dentro de Electron)
     const api = window.cilix;
     // Sin puente de Electron (modo navegador): ocultar controles inútiles.
@@ -356,6 +514,15 @@
       if (api) api.setAlwaysOnTop(on);
     });
     els.pin.classList.add('active'); // fijada por defecto
+
+    // Voz: el primer gesto del usuario desbloquea el autoplay del navegador,
+    // así el TTS suena solo sin tener que volver a tocar nada.
+    window.addEventListener('pointerdown', unlockAudio, { capture: true });
+    const unlockBtn = document.getElementById('voice-unlock');
+    if (unlockBtn) unlockBtn.addEventListener('click', () => {
+      state.audioUnlocked = false;
+      unlockAudio();
+    });
   }
 
   // ══ Arranque ══════════════════════════════════════════════════════════════

@@ -271,6 +271,32 @@ class OSController:
         logger.info("📦 Aplicaciones detectadas: %d", len(installed))
         return installed
 
+    # Emuladores de terminal conocidos, en orden de preferencia. El sistema
+    # puede no tener gnome-terminal (Pop!_OS/Debian/Arch varían), así que
+    # 'abre la terminal' resuelve el primero que realmente esté instalado.
+    TERMINAL_CANDIDATES = (
+        "gnome-terminal", "konsole", "xfce4-terminal", "tilix", "terminator",
+        "alacritty", "kitty", "deepin-terminal", "mate-terminal", "lxterminal",
+        "xterm",
+    )
+    _TERMINAL_ALIASES = ("terminal", "consola", "x-terminal-emulator", "shell")
+
+    def _resolve_terminal(self, app_name: str) -> str:
+        """Devuelve el primer emulador de terminal disponible si piden 'la
+        terminal' (o un terminal concreto que no está instalado)."""
+        low = (app_name or "").lower()
+        is_terminal = low in self._TERMINAL_ALIASES or low in self.TERMINAL_CANDIDATES
+        if not is_terminal:
+            return app_name
+        # Si pidieron un terminal concreto y SÍ existe, respetarlo.
+        if low not in self._TERMINAL_ALIASES and shutil.which(app_name):
+            return app_name
+        for cand in self.TERMINAL_CANDIDATES:
+            if shutil.which(cand):
+                logger.info("🖥️ terminal → usando %s", cand)
+                return cand
+        return app_name  # ninguno disponible: deja el mensaje de error original
+
     async def launch_application(self, app_name: str,
                                  arguments: Optional[List[str]] = None) -> CommandResult:
         """
@@ -287,6 +313,9 @@ class OSController:
             return CommandResult(False, "", "Sin nombre de aplicación", 1, 0.0, "")
         args = [self._sanitize(a) for a in (arguments or [])]
         start = time.time()
+
+        # Resolver 'la terminal' al emulador realmente instalado en el sistema.
+        app_name = self._resolve_terminal(app_name)
 
         binary = shutil.which(app_name)
         if binary:

@@ -28,6 +28,8 @@
       <span class="mode-badge" id="mode-badge">Ri</span>
     </div>
     <div class="win-controls">
+      <button id="btn-chat" class="ico" title="Ver historial de chats">🗂️</button>
+      <button id="btn-newchat" class="ico" title="Chat nuevo">✨</button>
       <button id="btn-pin" class="ico" title="Fijar arriba">📌</button>
       <button id="btn-min" class="ico" title="Minimizar">–</button>
       <button id="btn-close" class="ico" title="Ocultar">✕</button>
@@ -65,13 +67,23 @@
       <span class="label">Voz</span>
       <button id="voice-toggle" class="toggle on">ON</button>
     </div>
+    <div class="row">
+      <span class="label">Proactiva</span>
+      <button id="proactive-toggle" class="toggle on">ON</button>
+    </div>
     <div class="stats">
+      <div class="chip mood" id="mood-chip" title="Ánimo de Ri">😌</div>
       <div class="chip"><b>RAM</b> <span id="ram-val">–</span></div>
       <div class="chip"><b>CPU</b> <span id="cpu-val">–</span></div>
       <div class="chip"><b>Ri</b> <span id="ri-val">–</span></div>
       <div class="chip"><b>Re</b> <span id="re-val">–</span></div>
     </div>
   </aside>
+
+  <!-- Aviso: el navegador bloqueó la voz hasta un clic del usuario -->
+  <div id="voice-unlock" role="button" aria-label="Activar voz">
+    🔊 Toca para activar la voz de Ri
+  </div>
 
   <!-- Lógica de la interfaz -->
   <script src="/app/js/live2d.js"></script>

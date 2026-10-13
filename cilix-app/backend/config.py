@@ -122,6 +122,24 @@ class Settings:
     # Precarga el motor de voz tras arrancar (evita el retardo de la 1ª frase).
     # Se salta si la RAM está crítica. false = carga solo al primer uso.
     voice_warmup: bool = _env("CILIX_VOICE_WARMUP", True)
+    # Tono (+semitonas) aplicado a la voz Kokoro para hacerla MAS FEMENINA
+    # (ef_dora es la única voz femenina en español del pack Kokoro 1.x).
+    kokoro_pitch: float = _env("CILIX_KOKORO_PITCH", 2.0)
+    # Hilos de ONNXRuntime para Kokoro (menos hilos = menos RAM del arena).
+    ort_threads: int = _env("CILIX_ORT_THREADS", 2)
+    # Segundos de inactividad tras los cuales se DESCARGAN Kokoro/Whisper de
+    # RAM (~1.5-2 GB liberados en reposo; se recargan solos al volver a usarlos).
+    voice_idle_release_seconds: int = _env("CILIX_VOICE_IDLE_RELEASE", 300)
+
+    # ── Personalidad proactiva (pensamiento propio + ánimo) ──────────────
+    # Ri comenta cosas por su cuenta cuando llevas un rato sin interactuar.
+    proactive_enabled: bool = _env("CILIX_PROACTIVE", True)
+    proactive_idle_seconds: int = _env("CILIX_PROACTIVE_IDLE", 90)       # idle antes de hablar
+    proactive_min_gap_seconds: int = _env("CILIX_PROACTIVE_MIN_GAP", 240)  # gap entre frases
+    proactive_max_per_hour: int = _env("CILIX_PROACTIVE_MAX_HOUR", 6)    # tope por hora
+    proactive_quiet_start: int = _env("CILIX_PROACTIVE_QUIET_START", 23)  # hora silencio
+    proactive_quiet_end: int = _env("CILIX_PROACTIVE_QUIET_END", 8)
+    proactive_voice: bool = _env("CILIX_PROACTIVE_VOICE", True)          # texto + voz
 
     # ── Percepción / control ────────────────────────────────────────────────
     vision_enabled: bool = _env("CILIX_VISION_ENABLED", False)      # OFF por defecto (RAM)
@@ -140,6 +158,8 @@ class Settings:
             "vision_enabled": self.vision_enabled,
             "ram_limit_gb": self.total_ram_limit_gb,
             "dev_mode": self.dev_mode,
+            "proactive_enabled": self.proactive_enabled,
+            "proactive_voice": self.proactive_voice,
         }
 
 
@@ -158,9 +178,13 @@ def log_startup_summary() -> None:
         logger.info(f"   Cerebro Re     : {settings.re_model} (bajo demanda)")
     else:
         logger.info(f"   Cerebro unico  : {settings.ri_model} (Re desactivada)")
-    logger.info(f"   Voz (Piper)    : {Path(settings.piper_voice_path).name}")
+    logger.info(f"   Voz (TTS)      : {settings.tts_backend} "
+                f"(respaldo Piper: {Path(settings.piper_voice_path).name})")
     logger.info(f"   STT (Whisper)  : {settings.whisper_model}")
     logger.info(f"   Límite RAM     : {settings.total_ram_limit_gb} GB "
                 f"(crítico {settings.ram_critical_percent}%)")
     logger.info(f"   Visión         : {'ON' if settings.vision_enabled else 'OFF'}")
+    logger.info(f"   Proactividad   : {'ON' if settings.proactive_enabled else 'OFF'} "
+                f"(idle {settings.proactive_idle_seconds}s · voz "
+                f"{'ON' if settings.proactive_voice else 'OFF'})")
     logger.info("   100% LOCAL / OFFLINE · Sin APIs de pago")

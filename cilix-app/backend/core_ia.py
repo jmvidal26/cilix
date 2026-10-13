@@ -16,6 +16,7 @@ RAM y Re se libera rápidamente tras su uso.
 import asyncio
 import logging
 import random
+import re
 import time
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -100,6 +101,15 @@ class CoreIA:
         self.conversation_history: List[Dict[str, Any]] = []
         self.max_history_length = 12   # historial corto: menos RAM y menos tokens
 
+        # Cliente HTTP reutilizable hacia Ollama (una sola pila de conexión:
+        # evita crear/destruir cliente y handshake en cada petición).
+        self._client: Optional[httpx.AsyncClient] = None
+
+        # Memoria persistente (MemoryStore/SQLite). Se inyecta vía attach_memory().
+        self.memory = None
+        # Motor de personalidad/ánimo. Se inyecta vía attach_personality().
+        self.personality = None
+
         # Personalidades / prompts de sistema
         self.ri_personality = (
             "Eres Cilix, una asistente VTuber femenina que vive en el "
@@ -112,7 +122,9 @@ class CoreIA:
             "matices emocionales (ilusión, sorpresa, picardía) según el tema. "
             "Si no sabes algo, lo reconoces con humor y propones buscarlo. "
             "Evitas listas y párrafos largos salvo que se te pidan: prioriza "
-            "cercanía, personalidad y emoción."
+            "cercanía, personalidad y emoción. ESCUCHA DE VERDAD: recuerda y usa "
+            "con naturalidad el nombre y los datos que el usuario ya te dio "
+            "(estudios, trabajo, gustos) y NUNCA le repreguntes algo que ya sabes."
         )
         self.re_context = (
             "Eres Cilix-Re, la hermana mayor experta en programación. Enfoque: "
@@ -147,18 +159,27 @@ class CoreIA:
             logger.info("🔧 Modo dev: omitiendo verificación de Ollama")
             return True
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.get(f"{self.ollama_url}/api/tags")
-                if r.status_code == 200:
-                    n = len(r.json().get("models", []))
-                    logger.info("📦 Ollama OK · modelos disponibles: %d", n)
-                    return True
-                raise ConnectionError(f"Ollama respondió {r.status_code}")
+            client = await self._http(timeout=10.0)
+            r = await client.get(f"{self.ollama_url}/api/tags")
+            if r.status_code == 200:
+                n = len(r.json().get("models", []))
+                logger.info("📦 Ollama OK · modelos disponibles: %d", n)
+                return True
+            raise ConnectionError(f"Ollama respondió {r.status_code}")
         except Exception as exc:  # noqa: BLE001
             logger.error("❌ Sin conexión a Ollama (%s). Ejecuta: ollama serve", exc)
             raise
 
     # ── Gestión de RAM ─────────────────────────────────────────────────────
+    async def _http(self, timeout: float = 120.0) -> httpx.AsyncClient:
+        """Devuelve el cliente httpx persistente (creándolo si hace falta)."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                timeout=timeout,
+                limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+            )
+        return self._client
+
     def _memory_stressed(self) -> bool:
         """True si la RAM supera el umbral crítico (no conviene cargar Re)."""
         if not self.ram_guard:
@@ -206,12 +227,12 @@ class CoreIA:
             self.re_loaded = False
             return True
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                # keep_alive=0 fuerza la descarga inmediata en Ollama
-                await client.post(
-                    f"{self.ollama_url}/api/generate",
-                    json={"model": self.re_model, "keep_alive": 0},
-                )
+            client = await self._http(timeout=10.0)
+            # keep_alive=0 fuerza la descarga inmediata en Ollama
+            await client.post(
+                f"{self.ollama_url}/api/generate",
+                json={"model": self.re_model, "keep_alive": 0},
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Aviso al descargar Re: %s", exc)
         finally:
@@ -227,11 +248,11 @@ class CoreIA:
             self.ri_loaded = False
             return True
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
-                    f"{self.ollama_url}/api/generate",
-                    json={"model": self.ri_model, "keep_alive": 0},
-                )
+            client = await self._http(timeout=10.0)
+            await client.post(
+                f"{self.ollama_url}/api/generate",
+                json={"model": self.ri_model, "keep_alive": 0},
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Aviso al descargar Ri: %s", exc)
         finally:
@@ -240,14 +261,28 @@ class CoreIA:
         return True
 
     async def _warm_model(self, model: str, keep_alive: str) -> bool:
-        """'Calienta' un modelo en RAM mediante una petición mínima."""
+        """
+        'Calienta' un modelo en RAM mediante una petición mínima.
+
+        Lleva las MISMAS opciones de ahorro que _call_ollama: si se calentara
+        con el num_ctx por defecto (4096), Ollama reservaría una caché KV ~4x
+        mayor y el num_ctx pequeño posterior no la reduciría.
+        """
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                r = await client.post(
-                    f"{self.ollama_url}/api/generate",
-                    json={"model": model, "prompt": "", "keep_alive": keep_alive},
-                )
-                return r.status_code == 200
+            client = await self._http(timeout=60.0)
+            r = await client.post(
+                f"{self.ollama_url}/api/generate",
+                json={
+                    "model": model, "prompt": "", "keep_alive": keep_alive,
+                    "options": {
+                        "num_ctx": settings.ollama_num_ctx,
+                        "num_batch": settings.ollama_num_batch,
+                        "num_thread": settings.ollama_num_thread,
+                        "use_mmap": settings.ollama_use_mmap,
+                    },
+                },
+            )
+            return r.status_code == 200
         except Exception as exc:  # noqa: BLE001
             logger.error("❌ Error cargando %s: %s", model, exc)
             return False
@@ -353,11 +388,11 @@ class CoreIA:
                 "use_mmap": settings.ollama_use_mmap,
             },
         }
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            r = await client.post(f"{self.ollama_url}/api/generate", json=payload)
-            if r.status_code != 200:
-                raise ConnectionError(f"Ollama respondió {r.status_code}")
-            return r.json().get("response", "").strip()
+        client = await self._http()
+        r = await client.post(f"{self.ollama_url}/api/generate", json=payload)
+        if r.status_code != 200:
+            raise ConnectionError(f"Ollama respondió {r.status_code}")
+        return r.json().get("response", "").strip()
 
     def _dev_response(self, mode: AIMode) -> str:
         """Respuestas simuladas para pruebas sin Ollama."""
@@ -375,9 +410,16 @@ class CoreIA:
 
     # ── Construcción de prompts ────────────────────────────────────────────
     def _build_ri_prompt(self, message: str) -> str:
-        ctx = self._conversation_context()
+        ctx = self._conversation_context(last=5)
+        facts = self._user_facts_block()
+        bloque = (
+            "Lo que YA sabes del usuario (úsalo con naturalidad, NO lo vuelvas a preguntar):\n"
+            + facts + "\n\n"
+        ) if facts else ""
         return (
             f"{self.ri_personality}\n\n"
+            f"{self._mood_block()}"
+            f"{bloque}"
             f"Conversación reciente:\n{ctx}\n\n"
             f"Usuario: {message}\nCilix-Ri:"
         )
@@ -417,6 +459,121 @@ class CoreIA:
         if len(self.conversation_history) > self.max_history_length:
             self.conversation_history.pop(0)
 
+    # ── Memoria dinámica (hechos + historial persistente) ─────────────────
+    def attach_memory(self, memory) -> None:
+        """Conecta el MemoryStore para recordar hechos e historial."""
+        self.memory = memory
+
+    def attach_personality(self, personality) -> None:
+        """Conecta el PersonalityEngine para sesgar el ánimo en el prompt."""
+        self.personality = personality
+
+    def _mood_block(self) -> str:
+        """Bloque de estado interior (ánimo) para el prompt, o cadena vacía."""
+        if not self.personality:
+            return ""
+        try:
+            return self.personality.bias_prompt() + "\n\n"
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def proactive_turn(self, seed: str) -> Dict[str, Any]:
+        """Genera un comentario espontáneo de Ri a partir de una 'semilla' de
+        impulso. NO se trata como turno del usuario (no contamina el historial
+        de Q/A). Devuelve {response, emotion, mode, duration, proactive}."""
+        start = time.time()
+        if self.dev_mode:
+            await asyncio.sleep(0.2)
+            text = random.choice([
+                "Por cierto… me gusta saber que sigues por aquí. 💕",
+                "Estaba pensando en voz alta: ojalá tu día esté yendo bien.",
+                "Si necesitas un respiro, aquí estoy, sin prisa.",
+            ])
+            emotion = EmotionDetector.detect_emotion(text)
+            return {"response": text, "emotion": emotion or "neutral",
+                    "mode": AIMode.RI.value, "duration": 0.2, "proactive": True}
+        # Asegurar Ri residente (sin forzar si el guard lo impide).
+        if not self.ri_loaded:
+            await self.load_ri_model()
+        prompt = (
+            f"{self.ri_personality}\n\n"
+            f"{self._mood_block()}"
+            f"Estás en silencio y te ocurre un impulso: {seed}.\n"
+            f"Di UNA frase corta, espontánea y en primera persona, coherente con tu "
+            f"ánimo. No saludes, no pidas permiso, no repitas el nombre del usuario: "
+            f"es solo tu pensamiento en voz alta.\nCilix-Ri:"
+        )
+        text = await self._call_ollama(prompt, self.ri_model, AIMode.RI)
+        emotion = EmotionDetector.detect_emotion(text)
+        if emotion == "neutral":
+            emotion = EmotionDetector.detect_emotion(seed)
+        return {
+            "response": text, "emotion": emotion, "mode": AIMode.RI.value,
+            "duration": round(time.time() - start, 3), "proactive": True,
+        }
+
+    def extract_facts(self, message: str) -> None:
+        """Extrae hechos clave del usuario con reglas ligeras (sin modelo NLP
+        adicional → ahorro de RAM) y los guarda de forma persistente."""
+        if not self.memory or not message:
+            return
+        low = message.lower()
+        m = re.search(r"(?:me llamo|mi nombre es|me dicen)\s+([a-záéíóúñ]+)", low)
+        if m:
+            self.memory.remember_fact("user.name", m.group(1).capitalize())
+        m = re.search(r"(?:estudiante de|estudio|curso de)\s+([^,\.]{3,60})", low)
+        if m:
+            self.memory.remember_fact("user.about", m.group(1).strip())
+        m = re.search(r"(?:trabajo en|trabajo de|mi trabajo es|me dedico a)\s+([^,\.]{3,60})", low)
+        if m:
+            self.memory.remember_fact("user.work", m.group(1).strip())
+        m = re.search(r"(?:me gusta|me gustan)\s+([^,\.]{3,60})", low)
+        if m:
+            self.memory.remember_fact("user.likes", m.group(1).strip())
+
+    def _user_facts_block(self) -> str:
+        """Resume los hechos guardados como líneas para el prompt de Ri."""
+        if not self.memory:
+            return ""
+        try:
+            facts = self.memory.get_all_facts()
+        except Exception:  # noqa: BLE001
+            return ""
+        lines = []
+        if facts.get("user.name"):
+            lines.append(f"- Su nombre es {facts['user.name']}.")
+        if facts.get("user.about"):
+            lines.append(f"- Es estudiante de {facts['user.about']}.")
+        if facts.get("user.work"):
+            lines.append(f"- Trabaja en {facts['user.work']}.")
+        if facts.get("user.likes"):
+            lines.append(f"- Le gusta {facts['user.likes']}.")
+        return "\n".join(lines)
+
+    def load_history_from_memory(self, session: str) -> None:
+        """Reconstruye la ventana de conversación desde SQLite para que el
+        contexto sobreviva a recargas/cierres (solo si no hay historial en RAM)."""
+        if not self.memory or self.conversation_history:
+            return
+        try:
+            rows = self.memory.recent_messages(
+                session, limit=self.max_history_length * 2)
+        except Exception:  # noqa: BLE001
+            return
+        hist: List[Dict[str, Any]] = []
+        pending_user = None
+        for r in rows:
+            role = r.get("role")
+            if role == "user":
+                pending_user = r.get("content")
+            elif role == "assistant" and pending_user is not None:
+                hist.append({
+                    "user": pending_user, "ai": r.get("content", ""),
+                    "mode": r.get("mode", "Ri"), "timestamp": r.get("ts", 0),
+                })
+                pending_user = None
+        self.conversation_history = hist[-self.max_history_length:]
+
     # ── Introspección / limpieza ───────────────────────────────────────────
     def is_model_loaded(self) -> bool:
         return self.ri_loaded or self.re_loaded
@@ -434,6 +591,8 @@ class CoreIA:
         """Libera recursos al apagar el servidor."""
         try:
             await self.unload_re_model()
+            if self._client is not None and not self._client.is_closed:
+                await self._client.aclose()
             logger.info("🧹 CoreIA limpiado")
         except Exception as exc:  # noqa: BLE001
             logger.error("❌ Error limpiando CoreIA: %s", exc)

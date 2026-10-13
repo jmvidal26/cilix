@@ -42,6 +42,7 @@ from config import FRONTEND_DIR, MODELS_DIR, STATIC_DIR, log_startup_summary, se
 from core_ia import CoreIA
 from memory import MemoryStore
 from os_controller import OSController
+from personality_engine import PersonalityEngine
 from vista_engine import VistaEngine
 
 # ── Logging robusto ────────────────────────────────────────────────────────
@@ -101,6 +102,16 @@ class CilixServer:
         self.osc = OSController()
         self.memory = MemoryStore()
         self.interp = CommandInterpreter()   # lenguaje natural → acciones del SO
+        # Conexión de la memoria persistente al cerebro + sesión estable: así el
+        # historial y los recuerdos sobreviven a recargas (un solo usuario = un
+        # hilo continuo de conversación).
+        self.ai.attach_memory(self.memory)
+        self.session_id = "cilix"
+        # Motor de personalidad/ánimo: sesga el prompt y decide cuándo hablar sola.
+        self.personality = PersonalityEngine(self.memory)
+        self.ai.attach_personality(self.personality)
+        self._last_user_ts = time.time()      # última interacción real del usuario
+        self._proactive_recent: List[float] = []  # ts de los últimos impulsos
 
         self.settings = {
             "voice_enabled": settings.voice_enabled,
@@ -110,6 +121,8 @@ class CilixServer:
             "ram_percent": self._ram_percent(),
             "cpu_percent": psutil.cpu_percent(interval=None),
             "mode": "Ri", "ri_loaded": False, "re_loaded": False,
+            "mood": self.personality.mood.to_dict(),
+            "proactive": settings.proactive_enabled,
         }
         self._bg_tasks: set = set()
         logger.info("🚀 CilixServer construido")
@@ -146,6 +159,9 @@ class CilixServer:
 
         # Tarea periódica de estado + autoprotección de RAM
         self._spawn(self._status_loop())
+        # Bucle de pensamiento proactivo (Ri habla sola en idle), si está activo.
+        if settings.proactive_enabled:
+            self._spawn(self._proactive_loop())
 
     async def shutdown(self) -> None:
         logger.info("🧹 Apagando Cilix...")
@@ -177,6 +193,7 @@ class CilixServer:
                     "mode": self.ai.active_mode.value,
                     "ri_loaded": self.ai.ri_loaded,
                     "re_loaded": self.ai.re_loaded,
+                    "mood": self.personality.mood.to_dict(),
                 })
                 # Autoprotección: liberar Re si el sistema sufre
                 if self.ai.re_loaded and self._memory_critical():
@@ -196,6 +213,67 @@ class CilixServer:
                 logger.error("❌ status_loop: %s", exc)
                 await asyncio.sleep(5)
 
+    # ── Pensamiento proactivo (Ri habla sola en idle) ─────────────────
+    def _recent_topic(self) -> Optional[str]:
+        """Último mensaje del usuario (truncado) como tema para un impulso."""
+        try:
+            rows = self.memory.recent_messages(self.session_id, limit=12)
+            for r in reversed(rows):
+                if r.get("role") == "user":
+                    return (r.get("content") or "")[:60] or None
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    async def _speak_broadcast(self, text: str) -> None:
+        """Sintetiza voz y la difunde a todos los clientes (sin cid concreto)."""
+        if not self.audio:
+            return
+        speech = await self.audio.synthesize(text)
+        if not speech:
+            return
+        await self.manager.broadcast({
+            "type": "speak", "audio": speech.wav_b64, "duration": speech.duration,
+            "volume_frames": speech.volume_frames, "sample_rate": speech.sample_rate,
+        })
+
+    async def _proactive_loop(self) -> None:
+        """Cuando el usuario lleva idle, Ri puede comentar algo por su cuenta
+        (texto + voz si procede). Respeta RAM, horas silencio y topes."""
+        await asyncio.sleep(5)   # dejar arrancar tranquilo
+        while True:
+            try:
+                await asyncio.sleep(10)
+                now = time.time()
+                self._proactive_recent = [
+                    t for t in self._proactive_recent if now - t < 3600]
+                if self._memory_critical():
+                    continue
+                seed = self.personality.should_speak(
+                    now, self._last_user_ts, self._proactive_recent,
+                    recent_topic=self._recent_topic())
+                if not seed:
+                    continue
+                resp = await self.ai.proactive_turn(seed)
+                answer = (resp.get("response") or "").strip()
+                if not answer:
+                    continue
+                emotion = resp.get("emotion", "neutral")
+                self._proactive_recent.append(now)
+                self.memory.add_message(self.session_id, "assistant", answer, "Ri", emotion)
+                await self.manager.broadcast({
+                    "type": "proactive", "text": answer, "emotion": emotion,
+                    "mode": "Ri", "mood": self.personality.mood.to_dict(),
+                })
+                if (settings.proactive_voice and self.settings["voice_enabled"]
+                        and self.audio and not self._memory_critical()):
+                    await self._speak_broadcast(answer)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.error("❌ proactive_loop: %s", exc)
+                await asyncio.sleep(15)
+
     # ── Despacho de mensajes WebSocket ─────────────────────────────────────
     async def handle(self, cid: str, data: Dict[str, Any]) -> None:
         mtype = data.get("type", "chat")
@@ -208,6 +286,10 @@ class CilixServer:
                 await self._handle_switch_mode(cid, data)
             elif mtype == "command":
                 await self._handle_command(cid, data)
+            elif mtype == "history":
+                await self._handle_history(cid)
+            elif mtype == "new_chat":
+                await self._handle_new_chat(cid)
             elif mtype == "window_info":
                 await self._handle_window_info(cid)
             elif mtype == "toggle_voice":
@@ -215,6 +297,12 @@ class CilixServer:
                 await self.manager.send(cid, {
                     "type": "settings_updated", "voice_enabled":
                         self.settings["voice_enabled"]})
+            elif mtype == "toggle_proactive":
+                settings.proactive_enabled = bool(data.get("enabled"))
+                self.status["proactive"] = settings.proactive_enabled
+                await self.manager.send(cid, {
+                    "type": "settings_updated",
+                    "proactive_enabled": settings.proactive_enabled})
             elif mtype == "ping":
                 await self.manager.send(cid, {"type": "pong", "ts": time.time()})
             else:
@@ -233,8 +321,13 @@ class CilixServer:
             await self.manager.send(cid, {"type": "error", "message": "Mensaje vacío"})
             return
 
+        self._last_user_ts = time.time()   # el usuario interactuó → reset idle
         await self.manager.send(cid, {"type": "state", "state": "thinking"})
-        self.memory.add_message(cid, "user", text, mode)
+        # Recuperar el contexto persistido (1er mensaje tras recargar) y aprender
+        # hechos nuevos del usuario antes de responder.
+        self.ai.load_history_from_memory(self.session_id)
+        self.ai.extract_facts(text)
+        self.memory.add_message(self.session_id, "user", text, mode)
 
         # ¿Es una acción del sistema (lanzar app / comando / consultar estado)?
         # Se ejecuta de inmediato sin pasar por el cerebro.
@@ -247,7 +340,9 @@ class CilixServer:
         answer = resp.get("response", "")
         emotion = resp.get("emotion", "neutral")
         used_mode = resp.get("mode", mode)
-        self.memory.add_message(cid, "assistant", answer, used_mode, emotion)
+        self.memory.add_message(self.session_id, "assistant", answer, used_mode, emotion)
+        # El ánimo de Ri reacciona a este intercambio (persistente entre sesiones).
+        self.personality.on_interaction(text, emotion)
 
         # Respuesta textual + emoción para el avatar
         await self.manager.send(cid, {
@@ -280,7 +375,7 @@ class CilixServer:
             answer = f"No pude completar la acción: {result.error or 'el comando falló'}"
             emotion = "triste"
 
-        self.memory.add_message(cid, "assistant", answer, mode, emotion)
+        self.memory.add_message(self.session_id, "assistant", answer, mode, emotion)
         await self.manager.send(cid, {
             "type": "response", "text": answer, "emotion": emotion,
             "mode": mode, "duration": round(result.duration, 3),
@@ -357,6 +452,7 @@ class CilixServer:
         command = (data.get("command") or "").strip()
         if not command:
             return
+        self._last_user_ts = time.time()
         await self.manager.send(cid, {"type": "state", "state": "executing"})
         result = await self.osc.execute_safe_command(command)
         await self.manager.send(cid, {"type": "command_result", **result.to_dict()})
@@ -369,6 +465,22 @@ class CilixServer:
             await self.vista.initialize()
         info = await self.vista.get_active_window()
         await self.manager.send(cid, {"type": "window_info", **info})
+
+    # ── Historial / acceso a chats ─────────────────────────────────
+    async def _handle_history(self, cid: str) -> None:
+        """Envía los mensajes persistidos de la sesión actual al cliente."""
+        msgs = self.memory.recent_messages(self.session_id, limit=80)
+        await self.manager.send(cid, {"type": "history", "messages": msgs})
+
+    async def _handle_new_chat(self, cid: str) -> None:
+        """Inicia un chat nuevo: limpia la ventana en RAM del cerebro. Los
+        mensajes anteriores quedan guardados en SQLite (accesibles vía /history)."""
+        self.ai.conversation_history = []
+        await self.manager.send(cid, {"type": "new_chat_started"})
+
+    def history_payload(self, limit: int = 40) -> List[Dict[str, Any]]:
+        """Historial reciente para incluirlo en el saludo de conexión."""
+        return self.memory.recent_messages(self.session_id, limit=limit)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -439,6 +551,18 @@ async def status() -> JSONResponse:
     })
 
 
+@app.get("/history")
+async def history(limit: int = 80) -> JSONResponse:
+    """Devuelve el historial de conversación y los hechos recordados del
+    usuario. Base del 'acceso a chats' (frontend y depuración)."""
+    return JSONResponse({
+        "session": server.session_id,
+        "messages": server.memory.recent_messages(server.session_id, limit=limit),
+        "facts": server.memory.get_all_facts(),
+        "sessions": server.memory.list_sessions(limit=20),
+    })
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     """Canal principal en tiempo real para la interfaz."""
@@ -447,6 +571,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         "type": "connected", "client_id": cid, "state": "idle",
         "config": {**settings.as_public_dict(), **server.settings},
         "status": server.status,
+        "history": server.history_payload(40),
         "message": "Cilix conectada 💕",
     })
     try:

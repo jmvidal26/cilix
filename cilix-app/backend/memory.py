@@ -104,6 +104,48 @@ class MemoryStore:
             logger.error("❌ Error leyendo hecho: %s", exc)
             return default
 
+    def set_float_fact(self, key: str, value: float) -> None:
+        """Guarda un hecho numérico (para el estado de ánimo persistente)."""
+        self.remember_fact(key, str(float(value)))
+
+    def get_float_fact(self, key: str, default: float = 0.0) -> float:
+        """Recupera un hecho numérico; devuelve `default` si no existe o no es float."""
+        raw = self.get_fact(key)
+        if raw is None:
+            return default
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            return default
+
+    def get_all_facts(self) -> Dict[str, str]:
+        """Devuelve todos los hechos persistentes como dict {key: value}.
+        Se usa para inyectar el perfil del usuario en el prompt del cerebro."""
+        try:
+            with sqlite3.connect(self.db_path) as con:
+                rows = con.execute("SELECT key, value FROM facts").fetchall()
+            return {k: v for k, v in rows}
+        except sqlite3.Error as exc:  # noqa: BLE001
+            logger.error("❌ Error leyendo hechos: %s", exc)
+            return {}
+
+    def list_sessions(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Lista las conversaciones (sesiones) guardadas, de la más reciente a
+        la más antigua, con nº de mensajes y último timestamp. Base del
+        'acceso a chats' del frontend."""
+        try:
+            with sqlite3.connect(self.db_path) as con:
+                con.row_factory = sqlite3.Row
+                rows = con.execute(
+                    "SELECT session, COUNT(*) AS n, MAX(ts) AS last_ts"
+                    " FROM messages GROUP BY session ORDER BY last_ts DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.Error as exc:  # noqa: BLE001
+            logger.error("❌ Error listando sesiones: %s", exc)
+            return []
+
     def prune(self, retention_days: int = 30) -> int:
         """Elimina mensajes más antiguos al período de retención."""
         cutoff = time.time() - retention_days * 86400
