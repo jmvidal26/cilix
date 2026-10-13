@@ -23,6 +23,9 @@
     pin: $('btn-pin'), min: $('btn-min'), close: $('btn-close'),
     chat: $('btn-chat'), newchat: $('btn-newchat'),
     proactiveToggle: $('proactive-toggle'), mood: $('mood-chip'),
+    sudoCard: $('sudo-card'), sudoCmd: $('sudo-command'),
+    socialCard: $('social-card'), socialKind: $('social-kind'),
+    socialCaption: $('social-caption'), socialTags: $('social-tags'),
   };
 
   const state = {
@@ -37,6 +40,8 @@
     audioUnlocked: false,   // primer clic → el navegador permite reproducir
     pendingSpeech: null,    // audio bloqueado por autoplay, awaiting gesture
     speechRetryTs: 0,       // anti-bucle de reintento de reproducción
+    sudoReq: null,          // solicitud de aprobación de sudo en curso
+    socialDraft: null,      // último borrador social (caption/ruta)
   };
 
   // ══ WebSocket ═══════════════════════════════════════════════════════════
@@ -163,6 +168,22 @@
       case 'error':
         setState('idle');
         addMessage('sys', '⚠️ ' + (msg.message || 'Error'));
+        break;
+
+      case 'sudo_approval_required':
+        // Ri necesita permisos: el humano aprueba o rechaza (Human-in-the-Loop).
+        state.sudoReq = msg.request_id;
+        els.sudoCmd.textContent = msg.command || '';
+        els.sudoCard.classList.remove('hidden');
+        break;
+
+      case 'social_proposal':
+        state.socialDraft = msg;
+        els.socialKind.textContent = msg.kind === 'reel'
+          ? 'Borrador de Reel (15 s)' : 'Borrador de post';
+        els.socialCaption.textContent = msg.caption || '';
+        els.socialTags.textContent = (msg.hashtags || []).join(' ');
+        els.socialCard.classList.remove('hidden');
         break;
     }
   }
@@ -476,6 +497,33 @@
     els.send.addEventListener('click', submitText);
     els.input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitText(); });
     els.mic.addEventListener('click', toggleMic);
+
+    // ── Tarjetas de aprobación humana (sudo / social) ──
+    if (els.sudoCard) {
+      $('sudo-approve').addEventListener('click', () => {
+        if (state.sudoReq) send({ type: 'sudo_approval', request_id: state.sudoReq, approved: true });
+        state.sudoReq = null; els.sudoCard.classList.add('hidden');
+      });
+      $('sudo-deny').addEventListener('click', () => {
+        if (state.sudoReq) send({ type: 'sudo_approval', request_id: state.sudoReq, approved: false });
+        state.sudoReq = null; els.sudoCard.classList.add('hidden');
+      });
+    }
+    if (els.socialCard) {
+      $('social-copy').addEventListener('click', async () => {
+        const d = state.socialDraft || {};
+        const full = (d.caption || '') + '\n\n' + (d.hashtags || []).join(' ');
+        try { await navigator.clipboard.writeText(full); }
+        catch (e) { /* sin contexto seguro: el borrador vive en el .md */ }
+        addMessage('sys', '📋 Caption copiado — pégalo en Instagram y publica tú. 🤍');
+      });
+      $('social-open').addEventListener('click', () => {
+        const d = state.socialDraft || {};
+        const dir = (d.draft_path || '').replace(/\/[^\/]*$/, '');
+        send({ type: 'social_action', action: 'open', path: dir || '~/Documents/cilix-social' });
+      });
+      $('social-discard').addEventListener('click', () => els.socialCard.classList.add('hidden'));
+    }
 
     els.modeSwitch.querySelectorAll('button').forEach((b) => {
       b.addEventListener('click', () => send({ type: 'switch_mode', mode: b.dataset.mode }));

@@ -148,7 +148,21 @@ class CommandInterpreter:
                 intent.args = [str(nlines)]
             return intent
 
-        # 4) Consultas del sistema (patrones concretos para no secuestrar charla)
+        # 4) Contenido social (Human-in-the-Loop: Ri redacta, TÚ publicas):
+        #    "prepara un post sobre el proyecto", "haz un reel de 15 segundos
+        #     sobre la optimizacion de RAM", "caption para instagram de X".
+        #    Va ANTES de las consultas del sistema para que «…sobre la ram»
+        #    no sea secuestrada por el patrón de memoria.
+        m = re.search(r"\b(prepara|preparar|crea|crear|haz|hacer|genera|generar|redacta|redactar)\b"
+                      r"[^.]{0,50}?\b(post|publicacion|caption|reel|video|hilo|contenido (?:para )?redes|redes|instagram)\b"
+                      r"(?:[^.]*?(?:sobre|de|acerca de)\s+(.+?))?$", low)
+        if m:
+            sub = "reel" if (m.group(2) in ("reel", "video")) else "post"
+            topic = (m.group(3) or "").strip().rstrip("?.,!")
+            return Intent(kind="social", args=[sub, topic],
+                          reply_hint=f"Preparando un {sub} sobre «{topic or 'lo ultimo del dia'}»…")
+
+        # 5) Consultas del sistema (patrones concretos para no secuestrar charla)
         sysmap = [
             (r"\bgpu\b|grafica|aceleracion", "lspci | grep -iE 'vga|3d|display'"),
             (r"\b(que|cual es|dime).*(hora)\b", "date '+%H:%M del %d/%m/%Y'"),
@@ -165,7 +179,7 @@ class CommandInterpreter:
             if re.search(pat, low):
                 return Intent(kind="command", command=cmd, reply_hint="Aquí tienes el dato del sistema.")
 
-        # 5) Listar archivos:  "lista los archivos de Descargas", "lista tus carpetas",
+        # 6) Listar archivos:  "lista los archivos de Descargas", "lista tus carpetas",
         #    "lista los documentos de Downloads" (singulares y plurales, sin acentos).
         if re.search(r"\b(lista|listame|muestra|ensena|enseña|dime que hay|que archivos|que hay)\b", low) and \
            re.search(r"\b(archivos?|ficheros?|contenidos?|carpetas?|directorios?|documentos?|descargas?|imagenes?|fotos?|videos?)\b", low):
@@ -174,6 +188,27 @@ class CommandInterpreter:
                           reply_hint="Esto es lo que encontré.")
 
         return None  # no es una acción clara → conversación normal
+
+    # Puerta barata para el fallback LLM (§ robustez): solo merece gastar una
+    # micro-consulta de clasificación si la frase PARECE una orden disfrazada
+    # de charla (cortesía + verbo de acción): "¿me harías el favor de abrir");
+    # el regex principal ya catcheó las formas directas.
+    _ACTION_HINT_RE = re.compile(
+        r"\b(podr[íi]as|puedes|podr[íi]a|quisieras|quieres|me haces|me har[íi]as|"
+        r"hagas el favor|ser[íi]a posible|tendr[íi]as la bondad|enc[áa]rgate|intenta|trata de)\b"
+        r"[^.?!]{0,60}\b"
+        r"(abr[íi]r?|abre|lanzar?|lanza|ejecutar?|ejecuta|crear?|crea|hacer?|haz|"
+        r"listar?|lista|mostrar?|muestra|montar?|monta|analizar?|analiza|"
+        r"instalar?|instala|revisar?|revisa|abrirme|b[áa]scame|busca)\b", re.I)
+
+    @classmethod
+    def looks_like_action(cls, message: str) -> bool:
+        """True si la frase sugiere una orden disfrazada de charla (merece el
+        fallback JSON). Nunca coincide para charla normal: doble condición
+        (cortesía/imperativo + verbo de acción) dentro de la misma cláusula."""
+        if not message:
+            return False
+        return bool(cls._ACTION_HINT_RE.search(_norm(message)))
 
     # ── Ayudantes ──────────────────────────────────────────────────────────
     def _resolve_app(self, target: str) -> Optional[str]:

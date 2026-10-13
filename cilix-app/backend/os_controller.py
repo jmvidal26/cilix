@@ -9,8 +9,12 @@ Ejecuta comandos locales en Linux con una capa de seguridad estricta:
 · Límites de longitud, salida, tiempo de ejecución y variables de entorno.
 · Entorno de ejecución saneado (PATH/HOME/USER/LANG controlados).
 
-Nada de privilegios (sudo/su bloqueados). El objetivo es que la IA jamás
-pueda tumbar el sistema ni escapar de los límites de recursos.
+Sudo: AUTORIZADO pero con DOBLE guarda — se ejecuta sin contraseña (`sudo -n`,
+nunca interactivo) y su contenido se audita en `_sudo_guard()`: se niega si
+invoca comandos destructivos (rm/mkfs/dd/chmod…), toca rutas del sistema
+protegidas o coincide con patrones peligrosos. Además, todo `rm` normal se
+desvía a la PAPELERA (`gio trash`) para que un borrado accidental sea
+recuperable. El objetivo: dar poder sin riesgo de tumbar el sistema.
 """
 
 import asyncio
@@ -64,7 +68,9 @@ class OSController:
     def __init__(self, allowed_paths: Optional[List[str]] = None):
         self.allowed_paths = allowed_paths or [str(Path.home()), "/tmp", "/var/tmp"]
 
-        # Lista blanca (primer token del comando)
+        # Lista blanca (primer token del comando). Comandos de diagnóstico
+        # comunes de lectura: se marcan SAFE para que el sanitizer NO les
+        # borre pipes/argumentos (antes 'lspci | grep' quedaba mutilado).
         self.allowed_commands: Dict[str, CommandSafety] = {
             "ls": CommandSafety.SAFE, "cat": CommandSafety.SAFE,
             "file": CommandSafety.SAFE, "stat": CommandSafety.SAFE,
@@ -75,26 +81,59 @@ class OSController:
             "df": CommandSafety.SAFE, "free": CommandSafety.SAFE,
             "hostname": CommandSafety.SAFE, "which": CommandSafety.SAFE,
             "lspci": CommandSafety.SAFE, "lsblk": CommandSafety.SAFE,
+            "lsusb": CommandSafety.SAFE, "inxi": CommandSafety.SAFE,
+            "glxinfo": CommandSafety.SAFE, "nvidia-smi": CommandSafety.SAFE,
+            "du": CommandSafety.SAFE, "sort": CommandSafety.SAFE,
+            "systemctl": CommandSafety.SAFE, "journalctl": CommandSafety.SAFE,
+            "hostnamectl": CommandSafety.SAFE, "pwd": CommandSafety.SAFE,
+            "echo": CommandSafety.SAFE, "printf": CommandSafety.SAFE,
             "top": CommandSafety.SAFE, "ps": CommandSafety.SAFE,
             "xdg-open": CommandSafety.SAFE, "nautilus": CommandSafety.SAFE,
+            "gio": CommandSafety.SAFE, "udisksctl": CommandSafety.SAFE,
+            "flatpak": CommandSafety.SAFE, "gtk-launch": CommandSafety.SAFE,
+            # Gestión de archivos no destructiva (rm se desvía a papelera arriba)
+            "mkdir": CommandSafety.SAFE, "touch": CommandSafety.SAFE,
+            "cp": CommandSafety.SAFE, "mv": CommandSafety.SAFE,
+            # Administración (útilas con sudo -n + _sudo_guard): paquetes,
+            # servicios, red, logs. Se marcan SAFE para no mutilar argumentos.
+            "apt": CommandSafety.SAFE, "apt-get": CommandSafety.SAFE,
+            "dpkg": CommandSafety.RESTRICTED, "add-apt-repository": CommandSafety.SAFE,
+            "timedatectl": CommandSafety.SAFE, "loginctl": CommandSafety.SAFE,
+            "localectl": CommandSafety.SAFE, "nmcli": CommandSafety.SAFE,
+            "networkctl": CommandSafety.SAFE, "snap": CommandSafety.SAFE,
+            "blkid": CommandSafety.SAFE, "modprobe": CommandSafety.RESTRICTED,
+            "dkms": CommandSafety.SAFE,
             "gedit": CommandSafety.SAFE, "firefox": CommandSafety.SAFE,
             "chromium": CommandSafety.SAFE, "code": CommandSafety.SAFE,
             "python3": CommandSafety.RESTRICTED, "node": CommandSafety.RESTRICTED,
         }
 
-        # Lista negra: comandos destructivos o privilegiados
+        # Lista negra: comandos destructivos o privilegiados SIN GUARDA.
+        # 'sudo' ya no está aquí: se permite pero pasa por _sudo_guard().
         self.blocked_commands = {
-            "rm", "rmdir", "del", "format", "dd", "mkfs", "shred",
-            "sudo", "su", "chmod", "chown", "passwd", "useradd", "userdel",
-            "shutdown", "reboot", "halt", "poweroff", "ifconfig", "iptables",
-            "bash", "sh", "zsh", "perl", "eval",
+            "rm", "rmdir", "del", "format", "mkfs", "shred", "wipefs", "truncate",
+            "dd", "passwd", "useradd", "userdel", "groupdel", "visudo",
+            "shutdown", "reboot", "halt", "poweroff", "init", "telinit",
+            "ifconfig", "iptables", "ufw", "chown", "chmod", "chroot",
+            "bash", "sh", "zsh", "perl", "eval", "mkswap", "fdisk", "parted", "lvremove",
         }
 
-        # Patrones peligrosos (regex)
+        # Rutas del sistema que NUNCA deben borrarse/modificarse, ni con sudo.
+        self.protected_paths = [
+            "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64",
+            "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/usr", "/var",
+            "/home", os.path.expanduser("~/.ssh"), os.path.expanduser("~/.gnupg"),
+            os.path.expanduser("~/.config"),
+        ]
+
+        # Patrones peligrosos (regex) — se aplican TAMBIÉN dentro de sudo.
         self.dangerous_patterns = [
-            r"rm\s+-[rf]", r":\(\)\s*\{.*\};\s*:",       # rm -rf / fork bomb
-            r">\s*/dev/", r"\|\s*(bash|sh)\b",           # redirección / pipe a shell
-            r"\$\(", r"`", r";\s*rm", r"&&\s*rm",
+            r"rm\s+-[rf]{1,2}\s+(/|~|\$HOME|\*)",      # rm -rf /  |  rm -rf ~
+            r"rm\s+(-[a-z]*\s+)*/(\s|$|\*|bin|etc|usr|var|home|boot|root|sys|dev|lib|proc)",
+            r":\(\)\s*\{.*\};\s*:",                    # fork bomb
+            r">\s*/dev/(sd|nvme|hd)", r"\|\s*(bash|sh|zsh)\b",
+            r"mkfs(\.|\s)", r"dd\s+.*of=/dev/", r"chmod\s+(-R\s+)?777\s+/",
+            r"\$\(", r"`", r";\s*rm", r"&&\s*rm", r";\s*sudo", r"&&\s*sudo",
         ]
 
         self.limits = {
@@ -110,6 +149,46 @@ class OSController:
         }
         self._apps_cache: Optional[Dict[str, Any]] = None
         logger.info("🛡️ OSController inicializado")
+
+    # ── Salvaguardas sudo / rutas protegidas ─────────────────────────────
+    def _touches_protected(self, text: str) -> Optional[str]:
+        """Devuelve la ruta protegida mencionada en `text`, o None."""
+        try:
+            toks = shlex.split(text)
+        except ValueError:
+            toks = text.split()
+        for t in toks:
+            if t.startswith("-") or "$" in t:
+                continue
+            p = os.path.expanduser(t)
+            if not p.startswith("/"):
+                continue
+            for prot in self.protected_paths:
+                if prot == "/":
+                    if p == "/":
+                        return "/"
+                elif p == prot or p.startswith(prot + "/"):
+                    return prot
+        return None
+
+    def _sudo_guard(self, rest: List[str]) -> Tuple[CommandSafety, str]:
+        """Audita un `sudo <cmd>`: autoriza pero bloquea lo destructivo contra
+        rutas del sistema y comandos de la lista negra (aunque lleven sudo)."""
+        if not rest:
+            return CommandSafety.BLOCKED, "sudo sin comando"
+        inner = " ".join(rest)
+        inner_base = Path(rest[0]).name.lower()
+        if inner_base in self.blocked_commands or inner_base == "sudo":
+            return CommandSafety.BLOCKED, f"sudo {inner_base}: operación destructiva prohibida"
+        for pat in self.dangerous_patterns:
+            if re.search(pat, inner, re.IGNORECASE):
+                return CommandSafety.BLOCKED, f"Patrón peligroso bajo sudo: {pat}"
+        if inner_base in ("mv", "tee", "truncate") and self._touches_protected(inner):
+            return CommandSafety.BLOCKED, "sudo: intento de tocar rutas del sistema"
+        safety, reason = self.classify(inner)   # hereda la clasificación interna
+        if safety == CommandSafety.BLOCKED:
+            return CommandSafety.BLOCKED, f"sudo → {reason}"
+        return safety, f"sudo permitido ({reason})"
 
     # ── Clasificación y saneado ────────────────────────────────────────────
     def classify(self, command: str) -> Tuple[CommandSafety, str]:
@@ -130,6 +209,9 @@ class OSController:
             return CommandSafety.BLOCKED, "Comando vacío"
 
         base = Path(parts[0]).name.lower()
+        # 'sudo' se AUTORIZA pero se audita lo de dentro (no todo vale).
+        if base == "sudo":
+            return self._sudo_guard(parts[1:])
         if base in self.blocked_commands:
             return CommandSafety.BLOCKED, f"Comando bloqueado: {base}"
         if base in self.allowed_commands:
@@ -398,6 +480,27 @@ class OSController:
     ) -> CommandResult:
         """Valida, sanitiza y ejecuta un comando con límites de recursos."""
         start = time.time()
+
+        # ── 'rm' → PAPELERA (gio trash): borrado recuperable, nunca real.
+        # Solo para rutas de usuario; si apunta a zonas del sistema, se deja
+        # que classify() lo bloquee con su motivo explícito.
+        stripped = command.strip()
+        m = re.match(r"^rm\s+(?![/-].*\s/(bin|boot|dev|etc|lib|proc|root|run|sbin|srv|sys|usr|var))(.+)$",
+                     stripped, re.IGNORECASE)
+        if m and not self._touches_protected(m.group(2)):
+            try:
+                toks = shlex.split(m.group(2))
+                paths = [t for t in toks if not t.startswith("-")]
+            except ValueError:
+                paths = []
+            if paths:
+                logger.info("♻️ rm redirigido a papelera (recuperable): %s", " ".join(paths))
+                command = "gio trash " + " ".join(shlex.quote(p) for p in paths)
+
+        # ── 'sudo' sin contraseña: -n evita que el proceso se quede esperando.
+        if re.match(r"^sudo\s+(?!-)", stripped):
+            command = "sudo -n " + stripped[len("sudo"):].lstrip()
+
         safety, reason = self.classify(command)
 
         if safety == CommandSafety.BLOCKED:
@@ -444,7 +547,8 @@ class OSController:
             duration = time.time() - start
             self.stats["total_execution_time"] += duration
 
-            logger.info("✅ Comando (%.2fs, exit %s)", duration, proc.returncode)
+            logger.info("✅ Comando (%.2fs, exit %s): %.140s",
+                        duration, proc.returncode, command)
             return CommandResult(proc.returncode == 0, output.strip(), error.strip(),
                                  proc.returncode, duration, command)
 

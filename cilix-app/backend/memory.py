@@ -80,6 +80,18 @@ class MemoryStore:
             logger.error("❌ Error leyendo historial: %s", exc)
             return []
 
+    def clear_session(self, session: str) -> int:
+        """Borra los MENSAJES de una sesión (historial de conversación),
+        conservando los HECHOS del perfil del usuario (tabla facts). Devuelve
+        nº de filas eliminadas. Se usa en 'new_chat'."""
+        try:
+            with sqlite3.connect(self.db_path) as con:
+                cur = con.execute("DELETE FROM messages WHERE session=?", (session,))
+                return cur.rowcount
+        except sqlite3.Error as exc:  # noqa: BLE001
+            logger.error("❌ Error limpiando sesión: %s", exc)
+            return 0
+
     def remember_fact(self, key: str, value: str) -> None:
         """Guarda/actualiza un hecho persistente (nombre, preferencias...)."""
         try:

@@ -80,6 +80,28 @@
     </div>
   </aside>
 
+  <!-- Aprobación humana de operaciones privilegiadas (sudo) -->
+  <div id="sudo-card" class="approval-card hidden" role="alertdialog" aria-label="Aprobación de comando">
+    <div class="approval-head">🔐 <b>Ri quiere usar privilegios de administrador</b></div>
+    <code id="sudo-command" class="approval-cmd"></code>
+    <div class="approval-actions">
+      <button id="sudo-approve" class="ok">Aprobar</button>
+      <button id="sudo-deny" class="no">Rechazar</button>
+    </div>
+  </div>
+
+  <!-- Propuesta de contenido social (Ri redacta, tú publicas) -->
+  <div id="social-card" class="approval-card hidden" role="dialog" aria-label="Borrador social">
+    <div class="approval-head">📝 <b id="social-kind">Borrador de post</b></div>
+    <div id="social-caption" class="approval-cmd caption"></div>
+    <div id="social-tags" class="social-tags"></div>
+    <div class="approval-actions">
+      <button id="social-copy" class="ok">Copiar caption</button>
+      <button id="social-open">Abrir carpeta</button>
+      <button id="social-discard" class="no">Descartar</button>
+    </div>
+  </div>
+
   <!-- Aviso: el navegador bloqueó la voz hasta un clic del usuario -->
   <div id="voice-unlock" role="button" aria-label="Activar voz">
     🔊 Toca para activar la voz de Ri

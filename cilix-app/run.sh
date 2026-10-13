@@ -42,6 +42,10 @@ echo "🔎 Verificando requisitos locales…"
 if command -v ollama >/dev/null 2>&1; then
   if ! curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
     echo "🡮   Ollama instalado pero no en ejecución → arrancando 'ollama serve'…"
+    # KV cache en q8 + flash attention: cuantiza la memoria de atención si hay
+    # GPU; en CPU solo no aplica (no rompe nada) y num_ctx=1024 del backend ya
+    # mantiene la KV pequeña de todos modos.
+    OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 \
     nohup ollama serve >/tmp/cilix_ollama.log 2>&1 &
     sleep 3
   fi

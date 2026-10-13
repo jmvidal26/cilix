@@ -12,23 +12,40 @@
   const MODEL_URL = '/models/design_genius_white/Design_genius(1).model3.json';
 
   // Mapa emoción → parámetros REALES del modelo design_genius_white
-  // (verificados en su .cdi3.json: ParamMouthForm=sonrisa, ParamBrow*=cejas,
-  //  ParamCheek=rubor, Param33=enojo, Param38=llanto). NO se usa ParamEyeLOpen
-  //  para no pisar el parpadeo automático del modelo.
+  // (verificados en su .cdi3.json). Nombres chinos de los switches: Param32=
+  // 爱心(cariño) Param33=生气(enojo) Param35=圈圈(mareo) Param36=脸红(rubor)
+  // Param37=嘟嘴(pucherito) Param38=流泪开关(llanto) Param39=左泪水(lágrima).
+  // NO se tocan ParamEyeLOpen/ROpen ni ParamAngle*/Ball* (los gobierna el bucle
+  // idle: parpadeo + seguimiento de cursor), para no pelear con ellos.
   const EMOTION_PARAMS = {
     neutral:      {},
-    feliz:        { ParamMouthForm: 1, ParamEyeLSmile: 1, ParamEyeRSmile: 1, ParamCheek: 0.5 },
-    triste:       { ParamMouthForm: -0.6, ParamBrowLAngle: -1, ParamBrowRAngle: -1,
-                    ParamBrowLY: -0.4, ParamBrowRY: -0.4, Param38: 1 },
-    enfadado:     { ParamMouthForm: -0.5, ParamBrowLForm: -1, ParamBrowRForm: -1, Param33: 1 },
-    sorprendido:  { ParamBrowLY: 1, ParamBrowRY: 1, ParamMouthForm: -0.2 },
-    concentrado:  { ParamBrowLForm: 0.4, ParamBrowRForm: 0.4 },
+    feliz:        { ParamMouthForm: 1, ParamEyeLSmile: 1, ParamEyeRSmile: 1,
+                    ParamCheek: 0.6, Param36: 0.8, Param32: 0.35,
+                    ParamBrowLY: 0.2, ParamBrowRY: 0.2,
+                    ParamBrowLAngle: 0.3, ParamBrowRAngle: 0.3 },
+    triste:       { ParamMouthForm: -0.8, ParamBrowLAngle: -1, ParamBrowRAngle: -1,
+                    ParamBrowLY: -0.35, ParamBrowRY: -0.35,
+                    ParamBrowLForm: -0.3, ParamBrowRForm: -0.3,
+                    Param38: 1, Param39: 1 },
+    enfadado:     { ParamMouthForm: -0.6, ParamBrowLForm: -1, ParamBrowRForm: -1,
+                    ParamBrowLX: -0.4, ParamBrowRX: 0.4,
+                    ParamBrowLAngle: 0.8, ParamBrowRAngle: 0.8,
+                    ParamBrowLY: -0.4, ParamBrowRY: -0.4,
+                    Param33: 1, Param36: 0.35 },
+    sorprendido:  { ParamBrowLY: 1, ParamBrowRY: 1, ParamBrowLForm: 0.5, ParamBrowRForm: 0.5,
+                    ParamBrowLAngle: 0.5, ParamBrowRAngle: 0.5,
+                    ParamMouthForm: -0.3, Param35: 0.5, Param36: 0.3 },
+    concentrado:  { ParamBrowLForm: 0.35, ParamBrowRForm: 0.35,
+                    ParamBrowLX: 0.3, ParamBrowRX: -0.3,
+                    ParamBrowLY: -0.15, ParamBrowRY: -0.15, ParamMouthForm: 0.15 },
   };
   // Parámetros que siempre se interpolan (vuelven a 0 = neutro al cambiar).
   const DRIVEN_PARAMS = [
     'ParamMouthForm', 'ParamEyeLSmile', 'ParamEyeRSmile',
     'ParamBrowLForm', 'ParamBrowRForm', 'ParamBrowLY', 'ParamBrowRY',
-    'ParamBrowLAngle', 'ParamBrowRAngle', 'ParamCheek', 'Param33', 'Param38',
+    'ParamBrowLX', 'ParamBrowRX', 'ParamBrowLAngle', 'ParamBrowRAngle',
+    'ParamCheek', 'Param32', 'Param33', 'Param35', 'Param36', 'Param37',
+    'Param38', 'Param39',
   ];
 
   const CilixAvatar = {
@@ -220,15 +237,20 @@
           const mw = this.model.width || 300;
           const mh = this.model.height || 300;
 
-          // Emociones: interpolación suave + micro-flutter en cejas (no congelada)
+          // Emociones: interpolación suave + micro-vida (no cara congelada)
           for (const p of DRIVEN_PARAMS) {
             const tgt = this._emotionTarget[p] || 0;
             const cur = this._emotionCur[p] || 0;
-            const v = cur + (tgt - cur) * 0.15;
+            const v = cur + (tgt - cur) * 0.18;   // ataque un pelín más ágil
             this._emotionCur[p] = v;
             let out = v;
             if (p === 'ParamBrowLY' || p === 'ParamBrowRY') {
-              out += Math.sin(t * 0.7 + (p === 'ParamBrowRY' ? 1.3 : 0)) * 0.03;
+              out += Math.sin(t * 0.7 + (p === 'ParamBrowRY' ? 1.3 : 0)) * 0.035;
+            } else if (Math.abs(tgt) > 0.05 &&
+                       (p === 'ParamCheek' || p === 'Param36' ||
+                        p === 'ParamEyeLSmile' || p === 'ParamEyeRSmile')) {
+              // rubor/sonrisa 'respiran' suave: la emoción se siente viva
+              out += Math.sin(t * 1.3 + 0.6) * 0.04;
             }
             this._setParam(p, clamp(out, -1, 1));
           }

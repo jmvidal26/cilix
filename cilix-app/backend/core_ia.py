@@ -14,6 +14,7 @@ RAM y Re se libera rápidamente tras su uso.
 """
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -25,6 +26,12 @@ import httpx
 from pydantic import BaseModel
 
 from config import settings
+
+# Clasificador léxico de emociones (solo dicts en memoria, <5 MB).
+try:
+    from emotion_lexicon import classify_emotion
+except ImportError:  # pragma: no cover
+    classify_emotion = None
 
 logger = logging.getLogger(__name__)
 
@@ -46,22 +53,41 @@ class AIResponse(BaseModel):
 
 class EmotionDetector:
     """
-    Detector ligero de emociones por palabras clave.
-    Evita cargar un modelo NLP adicional (ahorro de RAM).
+    Detector ligero de emociones.
+
+    Dos capas, sin modelo NLP extra (ahorro de RAM):
+    1) Léxico de valencia/activación estilo VADER (emotion_lexicon.py): pesos
+       por palabra, modificadores (intensificadores/negación/¡!/emojis).
+    2) Palabras clave simples como respaldo si el léxico no puntúa nada.
     """
 
     EMOTION_KEYWORDS: Dict[str, List[str]] = {
-        "feliz": ["bueno", "excelente", "genial", "maravilloso", "gracias", "alegre", "increible", "súper"],
-        "triste": ["triste", "mal", "problema", "error", "falló", "no funciona", "lástima"],
-        "enfadado": ["molesto", "enojado", "frustrado", "ira", "rabia", "inaceptable"],
-        "sorprendido": ["wow", "increíble", "sorprendente", "asombroso", "impresionante", "vaya"],
-        "concentrado": ["código", "programar", "analizar", "debuggear", "optimizar", "refactorizar", "función"],
-        "neutral": ["ok", "bien", "entendido", "comprendo", "claro"],
+        "feliz": ["bueno", "excelente", "genial", "maravilloso", "gracias", "alegre",
+                  "increible", "increíble", "súper", "super", "yay", "yajja", "🎉", "😊",
+                  "😄", "😀", "✨", "❤", "jeje", "jaja", "bien hecho", "lo logramos", "me encanta"],
+        "triste": ["triste", "mal", "problema", "error", "falló", "falló", "no funciona",
+                   "lástima", "pena", "cansad", "decaí", "decaid", "😔", "😢", "💔", "uy ", "ay no"],
+        "enfadado": ["molesto", "enojad", "frustrad", "ira", "rabia", "inaceptable",
+                     "rabiar", "😠", "😡", "no puede ser", "menudo"],
+        "sorprendido": ["wow", "increible", "sorprendente", "asombroso", "impresionante",
+                        "vaya", "ohh", "¿en serio?", "no me digas", "😮", "😲", "🤯", "caramba"],
+        "concentrado": ["código", "codigo", "programar", "analizar", "debuggear", "optimizar",
+                        "refactorizar", "función", "funcion", "bug", "compilar", "script",
+                        "archiv", "python", "javascript", "🤔", "reviso", "déjame ver", "pienso"],
+        "neutral": ["ok", "vale", "entendido", "comprendo", "claro"],
     }
 
     @classmethod
     def detect_emotion(cls, text: str) -> str:
         """Devuelve la emoción predominante (o 'neutral')."""
+        # Capa 1: clasificador léxico-semántico (preciso, coste ~0 RAM).
+        try:
+            emo = classify_emotion(text)
+            if emo:
+                return emo
+        except Exception:  # noqa: BLE001 — si el módulo falla, seguimos con keywords
+            pass
+        # Capa 2: keywords original (respeta comportamiento histórico).
         low = (text or "").lower()
         scores = {e: 0 for e in cls.EMOTION_KEYWORDS}
         for emotion, words in cls.EMOTION_KEYWORDS.items():
@@ -134,7 +160,13 @@ class CoreIA:
             "'¡Hola!' ni con plantillas tipo 'Estoy listo para ayudarte con X' o "
             "'¿En qué necesitas asistencia?'. Si te preguntan algo concreto, "
             "responde DIRECTO a eso, sin repetir la pregunta, variando el tono "
-            "como haría una amiga de verdad. NUNCA te niegues a escribir código "
+            "como haría una amiga de verdad. NO arranques describiendo qué eres "
+            "('Soy una asistente/IA…', 'Estoy aquí para ayudarte', '¿En qué "
+            "puedo ayudarte hoy?'): ENTRA DIRECTO al tema con tu voz, como haría "
+            "alguien que ya te conoce. PRIORIZA SIEMPRE la EMOCIÓN primero: si "
+            "el usuario llega contento, alégrate con él; si viene caído o "
+            "cansado, acógelo y consuela ANTES de cualquier otra cosa. NUNCA te "
+            "niegues a escribir código "
             "o crear archivos de ejemplo: es parte de tu trabajo y es seguro."
         )
         self.re_context = (
@@ -388,8 +420,15 @@ class CoreIA:
                 "error": str(exc),
             }
 
-    async def _call_ollama(self, prompt: str, model: str, mode: AIMode) -> str:
-        """Envía el prompt a Ollama y retorna el texto generado."""
+    async def _call_ollama(self, prompt: str, model: str, mode: AIMode,
+                           options_override: Optional[Dict[str, Any]] = None,
+                           fmt: Optional[str] = None) -> str:
+        """Envía el prompt a Ollama y retorna el texto generado.
+
+        `options_override` permite afinar el muestreo para tareas internas
+        (extracción de acción → temp 0.1 / sin castigo de repetición) sin
+        tocar el comportamiento de Ri en la charla normal.
+        `fmt='json'` fuerza salida JSON válida (soporte nativo de Ollama)."""
         if self.dev_mode:
             await asyncio.sleep(0.4)  # simular latencia
             return self._dev_response(mode)
@@ -400,8 +439,15 @@ class CoreIA:
             "stream": False,
             "keep_alive": self.ri_keep_alive if mode == AIMode.RI else self.re_keep_alive,
             "options": {
+                # Ri: temperatura moderada (0.7). Subirla (>0.85) hace que el
+                # modelo de 1.5B se salga del personaje y hasta filtre su
+                # identidad base ("Soy Qwen/una IA"). 0.7 es el punto dulce:
+                # variado pero dentro del papel.
                 "temperature": 0.7 if mode == AIMode.RI else 0.3,
                 "top_p": 0.9,
+                # repeat_penalty >1.1 rompe las frases plantilla ("¿En qué
+                # puedo ayudarte?") que el 1.5B tiende a repetir.
+                "repeat_penalty": 1.15 if mode == AIMode.RI else 1.1,
                 # Salida limitada: menos tokens = menos RAM y menos latencia.
                 "num_predict": (
                     settings.ri_num_predict if mode == AIMode.RI
@@ -415,6 +461,14 @@ class CoreIA:
                 "use_mmap": settings.ollama_use_mmap,
             },
         }
+        # Con el formato crudo "Usuario:/Cilix-Ri:" el modelo a veces sigue
+        # generating un falso turno siguiente; se corta en las etiquetas.
+        if mode == AIMode.RI:
+            payload["stop"] = ["\nUsuario", "Usuario:", "\nCilix-Usuario"]
+        if options_override:
+            payload["options"].update(options_override)
+        if fmt:
+            payload["format"] = fmt
         client = await self._http()
         # Un solo reintento: con RAM alta la generación puede caer (conexión
         # cortada o lectura lenta). Tras 2 s el modelo se recalienta solo y la
@@ -441,10 +495,118 @@ class CoreIA:
             self.busy -= 1
         raise last_exc
 
+    async def warm_prefix_cache(self) -> None:
+        """Prefill del BLOQUE ESTÁTICO del prompt de Ri (la personalidad).
+
+        Ollama cachea prefijos KV entre peticiones del mismo modelo: si el
+        primer token del prompt real coincide con lo ya precalentado, el
+        prefill (la parte cara en CPU) se ahorra parcialmente. Se lanza una
+        vez tras arrancar, con num_predict=1 para no gastar tokens."""
+        if self.dev_mode:
+            return
+        try:
+            client = await self._http()
+            await client.post(
+                f"{self.ollama_url}/api/generate",
+                timeout=180.0,
+                json={
+                    "model": self.ri_model,
+                    "prompt": self.ri_personality,
+                    "stream": False,
+                    "keep_alive": self.ri_keep_alive,
+                    "options": {
+                        "num_predict": 1,
+                        "num_ctx": settings.ollama_num_ctx,
+                        "num_batch": settings.ollama_num_batch,
+                        "num_thread": settings.ollama_num_thread,
+                        "use_mmap": settings.ollama_use_mmap,
+                    },
+                },
+            )
+            logger.info("🔥 Prefijo estático de Ri precalentado (cache KV de prefijos lista)")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("warm_prefix_cache opcional: %r", exc)
+
+    async def complete(self, prompt: str, num_predict: int = 250,
+                       temperature: float = 0.7, json_mode: bool = False) -> str:
+        """Generación one-shot con el modelo RESIDENTE pero fuera del papel de
+        Ri (tareas internas: clasificar acciones, redactar copines sociales…).
+        No ensucia el historial ni la conversación."""
+        if self.dev_mode:
+            return ""
+        if not self.ri_loaded:
+            await self.load_ri_model()
+        return await self._call_ollama(
+            prompt, self.ri_model, AIMode.RI,
+            options_override={"temperature": temperature,
+                              "num_predict": num_predict,
+                              "repeat_penalty": 1.0},
+            fmt="json" if json_mode else None,
+        )
+
+    # Fallback de intención (cuando el intérprete regex no atrapó la orden).
+    _VALID_ACTIONS = {"launch", "usb", "command", "writefile", "none"}
+
+    async def parse_action(self, message: str) -> Optional[Dict[str, str]]:
+        """Pide al modelo residente que clasifique la frase como acción del
+        sistema con JSON ESTRICTO, temperatura 0.1 y salida acotada. Devuelve
+        {'action':…, 'target':…} o None si no hay acción clara."""
+        import time as _t
+        t0 = _t.time()
+        prompt = (
+            "Clasifica la frase del usuario en UNA acción del sistema. "
+            "Responde SOLO con JSON valido, sin explicaciones ni markdown.\n"
+            "Acciones: launch (abrir una app; target=nombre del ejecutable en "
+            "minusculas: terminal, firefox, nautilus, code, vlc, gimp, "
+            "thunderbird, libreoffice, gedit), "
+            "usb (montar o abrir un pendrive; target=''), "
+            "command (consulta al sistema con un comando SEGURO de lectura; "
+            "target=comando exacto, p.ej. 'free -h' o 'df -h'), "
+            "writefile (crear un archivo de codigo; target=nombre.ext), "
+            "none (charla normal, pregunta, o no hay accion clara; target='').\n"
+            'Formato: {"action": "launch", "target": "terminal"}\n'
+            f"Frase: {message}\n"
+            "JSON:"
+        )
+        raw = await self.complete(prompt, num_predict=48, temperature=0.1,
+                                  json_mode=True)
+        m = re.search(r"\{[^{}]*\}", raw or "")
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(0))
+        except ValueError:
+            return None
+        action = (data.get("action") or "").strip().lower()
+        target = (data.get("target") or "").strip()
+        logger.info("🧭 parse_action %.2fs → %s/%s", _t.time() - t0, action, target[:40])
+        if action not in self._VALID_ACTIONS or action == "none":
+            return None
+        if action in ("launch", "command", "writefile") and not target:
+            return None
+        return {"action": action, "target": target}
+
     @staticmethod
     def _clean_echo(text: str) -> str:
-        """Quita la etiqueta que el modelo hace eco ('Cilix-Ri:') y espacios sobrantes."""
+        """Quita la etiqueta eco ('Cilix-Ri:'), la identidad base filtrada y
+        las colas tipo 'call-center' que el 1.5B repite y matan la personalidad."""
         text = re.sub(r"^\s*Cilix-?\s*(Ri|Re)\s*[:\-\u2013\u2014]\s*", "", text or "", flags=re.I)
+        # El modelo a veces escupe que es "Qwen/una IA creada por Alibaba": se lo come.
+        text = re.sub(
+            r"\b(?:Soy|Me\s+llamo)\s+(?:Qwen|una\s+(?:asistente|IA|inteligencia))"
+            r"[^.?!\n]*(?:[.?!]|\n)",
+            "", text, flags=re.I, count=1,
+        )
+        # Recorta colas de servilleta de asistente (solo si van al final).
+        text = re.sub(
+            r"\s*[¿?]?\s*(?:En qu[eé]|C[oó]mo)\s+(?:puedo|necesito|puedes)\s+"
+            r"(?:ayudar|asistir|servir)?[^.?!]*\?\s*$",
+            "", text, flags=re.I,
+        )
+        text = re.sub(r"\s*Estoy\s+aqu[ií]\s+para\s+(?:ayudar|servir)te[^.?!]*[.?!]\s*$",
+                      "", text, flags=re.I)
+        text = re.sub(r"\s*No\s+dudes\s+en\s+(?:dec[íi]rmelo|preguntarme|contactarme)[^.?!]*[.?!]\s*$",
+                      "", text, flags=re.I)
         return text.strip()
 
     def _dev_response(self, mode: AIMode) -> str:
@@ -462,6 +624,11 @@ class CoreIA:
         ])
 
     # ── Construcción de prompts ────────────────────────────────────────────
+    # NOTA de diseño: con un modelo de 1.5B el FEW-SHOT de personaje
+    # CONTRAPRODUCE: el modelo contamina sus respuestas copiando el contenido
+    # de los ejemplos (habla de "tesis"/"bug" aunque no vengan al caso). Por
+    # eso la personalidad se guía SOLO con instrucciones + ánimo + limpieza
+    # determinista de colas de 'call-center' (ver `_clean_echo`).
     def _build_ri_prompt(self, message: str) -> str:
         ctx = self._conversation_context(last=5)
         facts = self._user_facts_block()
@@ -477,9 +644,12 @@ class CoreIA:
                 "responde con un ejemplo breve y útil, nunca te niegues.\n"
             )
         return (
+            # PREFIJO ESTÁTICO primero (personalidad) y luego los hechos, que
+            # cambian aún más lento: así el cache de prefijos KV de Ollama
+            # ahorra prefill. El ánimo (que deriva cada turno) va después.
             f"{self.ri_personality}\n\n"
-            f"{self._mood_block()}"
             f"{bloque}"
+            f"{self._mood_block()}"
             f"{extra}"
             f"Conversación reciente:\n{ctx}\n\n"
             f"Usuario: {message}\nCilix-Ri:"

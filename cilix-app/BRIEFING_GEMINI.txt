@@ -1,0 +1,202 @@
+══════════════════════════════════════════════════════════════════════════════
+ BRIEFING TÉCNICO · PROYECTO "CILIX" (estado Octubre 2026)
+ Objetivo del documento: dar contexto completo a una IA (Gemini) para que
+ proponga mejoras realistas. Por favor NO sugieras soluciones que rompan las
+ restricciones de hardware ni que requieran servicios de pago/nube.
+══════════════════════════════════════════════════════════════════════════════
+
+1. QUÉ ES CILIX
+────────────────
+Asistente de escritorio tipo VTuber 100% LOCAL y offline (sin APIs de pago).
+Una personaje llamada "Ri" vive como overlay en el escritorio del usuario:
+habla (TTS), escucha (STT), muestra un avatar Live2D expresivo, charla con
+personalidad y además EJECUTA acciones del sistema (abrir apps, montar USBs,
+consultar estado, crear archivos de código, comandos de shell con sudo
+acotado). El usuario escribe o dicta en español; Ri responde en español.
+
+2. HARDWARE Y RESTRICCIONES DURAS (no negociables)
+──────────────────────────────────────────────────
+· Portátil Pop!_OS (Linux trixie/sid), 8 GB de RAM (7.4 GiB reales), GPU sólo
+  Intel UHD (Raptor Lake-P) → TODO inferencia corre en CPU.
+· Swap de 15 GB se usa habitualmente; hay que tolerar picos de swap.
+· Presupuesto realista para la app completa: backend Python + modelo Ollama +
+  navegador/Electron + motores de voz < ~3.5-4 GB residentes.
+· 100% offline: nada de APIs de pago ni llamadas salientes. Todo local.
+· El código lleva comentarios en español; convenciones de refactor no
+  destructivo (no reescribir módulos enteros, mejoras quirúrgicas).
+
+3. ARQUITECTURA Y STACK
+───────────────────────
+· Repo: ~/Downloads/cilix/cilix-app
+    backend/   FastAPI + WebSocket (uvicorn) en 127.0.0.1:8765
+    frontend/  HTML/JS; renderer con Pixi.js + pixi-live2d-display (Cubism 4)
+    electron/  capa opcional (overlay transparente); modo navegador es el
+               predeterminado por ahorro de RAM (run.sh --browser)
+    models/    design_genius_white (modelo Live2D), kokoro/, piper/ (voces)
+    scripts/   utilidades (incl. cilix-sudo-setup.sh)
+· Arranque: run.sh (crea .venv, instala requirements, arranca Ollama si hace
+  falta, lanza backend y abre navegador).
+
+4. CAPA DE IA (Ollama)
+──────────────────────
+· Cerebro único "Ri" = qwen2.5:3b residente (keep_alive), mapeado a disco
+  (use_mmap). Antes era qwen2.5:1.5b: sonaba IMPOSIBLE de humanizar por prompt
+  (ver lecciones en §9). Existe bandera dual-brain con "Re"=deepseek-coder:1.3b
+  para código, pero está DESACTIVADA por RAM (un solo cerebro responde todo).
+· Se usa /api/generate CRUDO (no /api/chat): el prompt termina en
+  "Usuario: {msg}\nCilix-Ri:" y hay stop=["\nUsuario","Usuario:"].
+  Razón: con /api/chat el modelo pequeño filtraba su identidad base
+  ("Soy Qwen, una IA de Alibaba") y sonaba a asistente genérica.
+· Sampling: temperature 0.7 (subir a >0.85 saca al modelo del personaje),
+  top_p 0.9, repeat_penalty 1.15, num_ctx 1024 (KV pequeña = ahorro RAM),
+  num_predict ~160-220.
+· Prompt = ri_personality (instrucciones anti-call-center, "emoción primero",
+  nunca negarse a escribir código) + bloque de ÁNIMO actual + hechos del
+  usuario + nota contextual si es código + últimas ~5 conversaciones.
+· Timeout de generación 300 s por petición (la máquina es lenta bajo swap).
+
+5. PERSONALIDAD Y PROACTIVIDAD
+──────────────────────────────
+· personality_engine.py: estado interior persistente (valence/energy/
+  sociability) con deriva temporal; reacciona a cada interacción; se inyecta
+  como texto "tu estado interior AHORA…" en el prompt.
+· Motor proactivo: si el usuario lleva idle >90 s, genera "semillas de
+  impulso" y Ri dice un pensamiento en voz alta (una frase corta) sin esperar
+  turno. Configurable por WS (toggle_proactive).
+· EmotionDetector: reglas por palabras clave + emojis sobre la respuesta →
+  emoción ("feliz/triste/enfadado/sorprendido/concentrado/neutral") que viaja
+  al frontend por WS y controla la cara del avatar. Es heurístico y a veces
+  etiqueta mal (p. ej. respuesta empática con ✨ → "feliz").
+
+6. COMANDOS DEL SISTEMA (lo que más fallaba antes)
+──────────────────────────────────────────────────
+· command_interpreter.py: intérprete de intenciones en español SOLO por regex
+  (sin LLM), diseño defensivo: si no hay coincidencia clara → None → charla
+  normal. Tipos (kind): launch (apps vía sinónimos), usb (montar+abrir),
+  help (catálogo), writefile (crear archivo de código), command (shell),
+  prefijo literal "!" o "$" → shell directo.
+· Cobertura actual: abrir apps/terminal (resuelve emuladores instalados),
+  Flatpak por nombre (caché de `flatpak list`), apps .desktop vía gtk-launch,
+  montar y abrir USB (udisksctl + xdg-open, tolera carrera de auto-montaje
+  de GNOME), crear carpetas, listar dirs con alias ES/EN, consultas de
+  sistema (ram/cpu/disco/gpu con `lspci | grep`, hora, fecha, procesos),
+  creación de archivos de código: "crea un archivo de python llamado pedro y
+  que tenga 300 líneas" → plantilla por lenguaje + relleno de líneas con
+  comentarios válidos (tope 500) en ~/Documents/cilix, sin sobrescribir, y lo
+  abre con xdg-open. El LLM NUNCA genera cientos de líneas (1.5B/3B no dan
+  para eso y satura la RAM).
+· LANG_EXTS mapea nombre de lenguaje → extensión (python→py, etc.).
+
+7. SEGURIDAD DEL EJECUTOR (os_controller.py)
+────────────────────────────────────────────
+· Lista blanca con niveles SAFE/RESTRICTED (SAFE preserva pipes/args; el
+  sanitizer para RESTRICTED elimina metacaracteres de shell).
+· Lista negra destructiva: rm rmdir mkfs dd shred wipefs truncate passwd
+  useradd shutdown reboot iptables chown chmod bash sh eval fdisk parted…
+· Patrones peligrosos regex: rm -rf / o ~, fork bombs, pipe a shell,
+  dd of=/dev/, chmod 777 /, sustitución de comando, backticks…
+· Rutas protegidas: / /bin /boot /dev /etc /lib* /proc /root /run /sbin /srv
+  /sys /usr /var /home ~/.ssh ~/.gnupg ~/.config.
+· SUDO: permitido pero con doble guarda:
+    – se reescribe a `sudo -n` (jamás interactivo; si pide clave, falla
+      limpio: "sudo: a password is required").
+    – _sudo_guard() audita lo de DENTRO del sudo: bloquea comandos de la
+      lista negra, anidación de sudo, patrones peligrosos y mv/tee/truncate
+      contra rutas protegidas. Apt/systemctl/journalctl/nmcli/snap etc. sí
+      pasan (marcados SAFE).
+    – scripts/cilix-sudo-setup.sh instala /etc/sudoers.d/99-cilix con
+      NOPASSWD SOLO para la lista acotada de binarios de gestión (validado
+      con visudo -c). Requiere ejecución manual única por el usuario.
+· Todo `rm` simple se reescribe a `gio trash` (borrado recuperable, sólo
+  rutas de usuario).
+· sandbox: entorno controlado (PATH/HOME), timeout 30 s, salida tope 1 MB,
+  longitud comando tope 1000, métricas de bloqueados/ejecutados.
+
+8. AVATAR LIVE2D Y VOZ
+──────────────────────
+· design_genius_white NO declara expressions en su model3.json → toda la
+  expresividad se hace escribiendo parámetros Cubism4 por frame
+  (coreModel.setParameterValueById) con interpolación 0.18/Frame.
+· Mapa EMOTION_PARAMS (frontend/js/live2d.js) usa switches reales verificados
+  en el .cdi3.json (nombres chinos): Param33=enojo, Param36=rubor,
+  Param38/39=llanto/lágrima, Param35=mareo, Param32=cariño, Param37=puchero,
+  más bocos/cejas/jerarquía de cejas (BrowLX/RX/Angle/Form) y EyeLSmile.
+  NO se tocan ParamEyeLOpen/ROpen ni ParamAngle*/EyeBall* (los gobierna el
+  bucle idle: parpadeo natural con curva, seguimiento de cursor con cabeza,
+  respiración/balanceo). Micro-vida: cejas y rubor "respiran" con senos.
+· Lip-sync: el backend envuelve el audio TTS en frames ~25 fps por WS; el
+  frontend abre boca con ataque rápido/cierre suave + gamma.
+· Voz: Kokoro (voz ef_dora, ONNX) principal, Piper (es_ES) como respaldo de
+  feminización, Whisper tiny para STT. Lazy-load y DESCARGA por inactividad
+  para liberar RAM; se recargan solos.
+· Transporte: WS con ping 60 s / timeout 300 s (valores grandes a propósito:
+  en repos los hilos Python se congelan bajo swap y con defaults estrictos
+  uvicorn cortaba con 1011).
+
+9. LECCIONES DURAS APRENDIDAS (no re-proponer esto)
+───────────────────────────────────────────────────
+· Modelos ≤1.5B + few-shot de personaje = CONTAMINACIÓN: el modelo copiaba
+  el contenido de los ejemplos ("tesis", "bug") en respuestas sin relación.
+  Se resolvió quitando el few-shot y subiendo de modelo.
+· qwen2.5:3b fue el salto real de personalidad (empatiza, celebra, varía);
+  1.5b era irrecuperable por prompt. Coste ~1 GB extra mitigado con mmap.
+· /api/chat con system prompt empeoró la personalidad en modelos pequeños
+  (fuga de identidad base). /api/generate crudo + etiqueta "Cilix-Ri:" es
+  más sumiso para roleplay.
+· Cliente httpx persistente HEREDA el timeout del primer llamador → usar
+  timeout POR PETICIÓN (salud 10 s, warm 90 s, unload 15 s, generar 300 s).
+  Este bug causó "problemilla técnico" aleatorio (ReadTimeout('')).
+· El guardián de RAM no debe descargar el modelo en plena generación:
+  contador `busy` (in-flight) bloquea el unload de emergencia.
+· GUIs lanzadas desde el backend necesitan DISPLAY/DBUS heredados +
+  `setsid … &` para sobrevivir y verse.
+
+10. ESTADOS/DEUDA CONOCIDA (candidatos de mejora)
+──────────────────────────────────────────────────
+· EmotionDetector es heurístico (keywords/emoji sobre texto) y a veces
+  etiqueta mal la emoción del avatar. El modelo no EMITE la emoción, se le
+  infiere. Opciones exploradas: pedir tag [emocion] al inicio (riesgo de
+  que se lo trague o lo repita mal). ¿Mejor un clasificador minúsculo local?
+· Latencia: respuesta típica 10-40 s (CPU + swap). Sin streaming al cliente
+  (respuestas cortas; el estado "thinking" cubre la espera).
+· Intérprete de intenciones es 100% regex: cubre patrones comunes pero no
+  parafraseo libre. No hay "fallback inteligente" cuando la acción la
+  podría deducir el LLM de forma segura (JSON de acción).
+· Memoria: hechos extraídos por regex simple (nombre/estudio/trabajo/gustos)
+  + mensajes en SQLite. No hay resumen automático de conversaciones largas
+  ni recuperación semántica (embeddings). nomic-embed-text SÍ está
+  disponible en Ollama por si cupiera en RAM.
+· El overlay usa navegador/Electron con canvas; en swap fuerte baja el FPS.
+· Sudo NOPASSWD: la lista del script es conservadora; falta decidir UX de
+  confirmación visual cuando Ri va a tocar algo privilegiado.
+· No hay tests automatizados del pipeline WS completo (se prueba a mano).
+· El modo dual (Re para código) está apagado por RAM; el prompt de código de
+  Ri intenta compensar.
+
+11. QUÉ NOS GUSTARÍA QUE PROPONGAS (concretamente)
+───────────────────────────────────────────────────
+1) Mejoras de PERSONALIDAD/EXPRESIVIDAD sin subir de modelo ni usar APIs de
+   pago (p. ej. detección de emoción más fiable con coste ~0 RAM, variety
+   pools, micro-movimientos del avatar ligados al ánimo, formas de "memoria
+   emocional").
+2) ROBUSTEZ del intérprete de comandos: ideas para cubrir parafraseo sin
+   LLM en el path caliente (¿gramáticas, scoring, un fallback de acción JSON
+   validado con schema?). Mantén el sandbox intacto.
+3) LATENCIA/RAM: estrategias concretas para reducir tiempo de respuesta de
+   3B en CPU (batching, prompt caching de Ollama, quantizaciones, kv q8,
+   prefetch del prefill con contexto vacío, etc.) y de la animación Live2D
+   bajo swap.
+4) SEGURIDAD sudo: revisión del diseño (guarda en Python + sudoers acotado).
+   ¿Hay escapes obvios? ¿Cómo añadir una capa de "aprobación humana"
+   barata en UI para comandos privilegiados?
+5) IDEAS de funciones nuevas coherentes con el contexto (asistente de
+   escritorio local con visión OFF, STT Whisper tiny, OS Pop!_OS): algo de
+   alto valor y bajo coste de RAM.
+Formato de respuesta preferido: lista priorizada (impacto/esfuerzo/RAM),
+señalando qué partes del diseño actual NO tocaría y por qué.
+
+══════════════════════════════════════════════════════════════════════════════
+ Fin del briefing. Si necesitas detalle de un módulo concreto (p. ej. el
+ prompt exacto de Ri, el mapa completo de parámetros Live2D o el sándwich de
+ seguridad del ejecutor), pídelo y se amplía ese punto.
+══════════════════════════════════════════════════════════════════════════════

@@ -37,12 +37,14 @@ import psutil
 import uvicorn
 
 from audio_engine import AudioEngine
-from command_interpreter import CommandInterpreter
+from clipboard_sentinel import ClipboardSentinel
+from command_interpreter import CommandInterpreter, Intent
 from config import FRONTEND_DIR, MODELS_DIR, STATIC_DIR, log_startup_summary, settings
 from core_ia import CoreIA
 from memory import MemoryStore
 from os_controller import OSController, CommandResult
 from personality_engine import PersonalityEngine
+from social_engine import SocialEngine
 from vista_engine import VistaEngine
 
 # ── Logging robusto ────────────────────────────────────────────────────────
@@ -112,6 +114,12 @@ class CilixServer:
         self.ai.attach_personality(self.personality)
         self._last_user_ts = time.time()      # última interacción real del usuario
         self._proactive_recent: List[float] = []  # ts de los últimos impulsos
+        # Agente de contenido social (Ri redacta; el humano publica).
+        self.social = SocialEngine(self.ai, lambda: self.audio)
+        # Aprobaciones humanas pendientes de sudo: rid → Future(bool).
+        self._sudo_pending: Dict[str, asyncio.Future] = {}
+        # Vigilante del portapapeles (errores copiados → ayuda proactiva).
+        self.clipboard = ClipboardSentinel(self._on_clip_error)
 
         self.settings = {
             "voice_enabled": settings.voice_enabled,
@@ -162,6 +170,11 @@ class CilixServer:
         # Bucle de pensamiento proactivo (Ri habla sola en idle), si está activo.
         if settings.proactive_enabled:
             self._spawn(self._proactive_loop())
+        # Precalentar el prefijo estático del prompt (cache KV de prefijos de
+        # Ollama): el primer prefill real ahorra ~la mitad del cómputo.
+        self._spawn(self.ai.warm_prefix_cache())
+        # Centinela del portapapeles: detecta errores copiados y Ri ofrece ayuda.
+        self._spawn(self.clipboard.run())
 
     async def shutdown(self) -> None:
         logger.info("🧹 Apagando Cilix...")
@@ -290,6 +303,10 @@ class CilixServer:
                 await self._handle_history(cid)
             elif mtype == "new_chat":
                 await self._handle_new_chat(cid)
+            elif mtype == "sudo_approval":
+                await self._handle_sudo_approval(data)
+            elif mtype == "social_action":
+                await self._handle_social_action(cid, data)
             elif mtype == "window_info":
                 await self._handle_window_info(cid)
             elif mtype == "toggle_voice":
@@ -332,6 +349,13 @@ class CilixServer:
         # ¿Es una acción del sistema (lanzar app / comando / consultar estado)?
         # Se ejecuta de inmediato sin pasar por el cerebro.
         intent = self.interp.interpret(text)
+        if intent is None and self.interp.looks_like_action(text):
+            # Fallback LLM: orden disfrazada de charla cortés ("¿me harías el
+            # favor de abrir la terminal?"). Solo se gasta la micro-consulta
+            # cuando el hint lo justifica; la charla normal NO paga este coste.
+            action = await self.ai.parse_action(text)
+            if action:
+                intent = self._intent_from_action(action)
         if intent is not None:
             await self._run_intent(cid, text, intent, mode)
             return
@@ -356,6 +380,119 @@ class CilixServer:
 
         await self.manager.send(cid, {"type": "state", "state": "idle"})
 
+    def _intent_from_action(self, action: Dict[str, str]) -> Optional[Intent]:
+        """Convierte el JSON del fallback LLM en una Intent ejecutable.
+        El target pasa por los mismos filtros (sandbox/whitelist) que el
+        intérprete regex: el modelo SUGIERE, el sándwich de seguridad dispone."""
+        kind, target = action["action"], action["target"]
+        if kind == "launch":
+            app = self.interp._resolve_app(target) or target
+            return Intent(kind="launch", app=app,
+                          reply_hint=f"Abriendo {app}…")
+        if kind == "usb":
+            return Intent(kind="usb", app="", reply_hint="Conectando el USB…")
+        if kind == "command":
+            return Intent(kind="command", command=target,
+                          reply_hint="Aquí tienes el dato del sistema.")
+        if kind == "writefile":
+            return Intent(kind="writefile", app=target,
+                          reply_hint=f"Listo, creé «{target}»:")
+        return None
+
+    async def _ask_sudo_approval(self, cid: str, command: str) -> bool:
+        """Human-in-the-loop: congela un comando privilegiado hasta que el
+        usuario apruebe o rechace en la tarjeta de la UI (90 s → rechazo).
+        La aprobación se pide SIEMPRE que la orden lleve sudo, aunque el
+        sándwich de Python ya la considere segura: doble control."""
+        rid = uuid.uuid4().hex[:8]
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._sudo_pending[rid] = fut
+        try:
+            await self.manager.send(cid, {
+                "type": "sudo_approval_required", "request_id": rid,
+                "command": command,
+                "message": "Ri quiere ejecutar esto con privilegios de administrador.",
+            })
+            logger.info("🔐 Aprobación humana solicitada para: %s", command[:120])
+            return await asyncio.wait_for(fut, timeout=90.0)
+        except asyncio.TimeoutError:
+            logger.info("🔐 Sudo sin respuesta (90 s) → rechazado por defecto")
+            return False
+        finally:
+            self._sudo_pending.pop(rid, None)
+
+    async def _handle_sudo_approval(self, data: Dict[str, Any]) -> None:
+        """Responde al clic del usuario en la tarjeta de aprobación."""
+        fut = self._sudo_pending.pop(data.get("request_id") or "", None)
+        if fut is not None and not fut.done():
+            fut.set_result(bool(data.get("approved")))
+
+    async def _run_social(self, cid: str, intent: Intent, mode: str) -> None:
+        """Genera un pack de contenido social y lo presenta como tarjeta.
+        NUNCA publica: el humano copia/abre el borrador (Human-in-the-Loop)."""
+        sub = intent.args[0] if intent.args else "post"
+        topic = intent.args[1] if len(intent.args) > 1 else ""
+        pack = await self.social.prepare(sub, topic)
+        if pack is not None and sub == "reel" and self.settings["voice_enabled"]:
+            await self.social.reel_voice(pack)   # voz del guion a .wav local
+        if pack is None:
+            answer = "Quise redactarlo pero el borrador no salió bien… ¿lo intentamos de nuevo?"
+            emotion = "triste"
+        else:
+            answer = ("¡Borrador listo! 📝 Lo dejé en «" + pack.draft_path +
+                      "». Tú lo revisas y publicas (Instagram odia los bots, "
+                      "mejor con Approval 😉):\n\n" + pack.summary())
+            emotion = "feliz"
+            await self.manager.send(cid, {
+                "type": "social_proposal", "request_id": uuid.uuid4().hex[:8],
+                "caption": pack.caption,
+                "hashtags": ["#" + h.lstrip("#") for h in pack.hashtags],
+                "draft_path": pack.draft_path,
+                "kind": pack.kind,
+            })
+        self.memory.add_message(self.session_id, "assistant", answer, mode, emotion)
+        await self.manager.send(cid, {
+            "type": "response", "text": answer, "emotion": emotion,
+            "mode": mode, "duration": 0.0,
+        })
+        if self.settings["voice_enabled"] and self.audio:
+            await self._speak(cid, intent.reply_hint or "Listo el borrador.")
+        await self.manager.send(cid, {"type": "state", "state": "idle"})
+
+    async def _handle_social_action(self, cid: str, data: Dict[str, Any]) -> None:
+        """Acciones de la tarjeta social: abrir la carpeta del borrador."""
+        if data.get("action") == "open":
+            path = (data.get("path") or "").strip()
+            if path:
+                await self.osc.execute_safe_command(f"xdg-open {path}")
+
+    async def _on_clip_error(self, snippet: str) -> None:
+        """ClipboardSentinel → Ri ofrece ayuda proactiva al ver un error copiado.
+        Respeta RAM crítica y el rate-limit interno del centinela."""
+        if self._memory_critical() or not settings.proactive_enabled:
+            return
+        first = next((l for l in snippet.splitlines() if l.strip()), "")[:140]
+        seed = (f"El usuario acaba de copiar al portapapeles este error: "
+                f"{first!r}. Ofrécete en UNA frase corta y natural a revisarlo "
+                "junto a él.")
+        try:
+            resp = await self.ai.proactive_turn(seed)
+            answer = (resp.get("response") or "").strip()
+            if not answer:
+                return
+            emotion = resp.get("emotion", "concentrado")
+            self._proactive_recent.append(time.time())
+            self.memory.add_message(self.session_id, "assistant", answer, "Ri", emotion)
+            await self.manager.broadcast({
+                "type": "proactive", "text": answer, "emotion": emotion,
+                "mode": "Ri", "mood": self.personality.mood.to_dict(),
+            })
+            if (settings.proactive_voice and self.settings["voice_enabled"]
+                    and self.audio and not self._memory_critical()):
+                await self._speak_broadcast(answer)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("clipboard→proactivo: %s", exc)
+
     async def _run_intent(self, cid: str, text: str, intent, mode: str) -> None:
         """Ejecuta una intención detectada (app o comando) y responde con el resultado."""
         await self.manager.send(cid, {"type": "state", "state": "executing"})
@@ -367,12 +504,26 @@ class CilixServer:
         elif intent.kind == "help":
             # Catálogo de comandos: no se ejecuta nada, reply_hint es el texto
             result = CommandResult(True, "", "", 0, 0.0, "help")
+        elif intent.kind == "social":
+            await self._run_social(cid, intent, mode)
+            return
         elif intent.kind == "writefile":
             # "haz un código llamado i.html" → plantilla real en ~/Documents/cilix
             nlines = int(intent.args[0]) if intent.args else 0
             result = await self.osc.create_code_file(intent.app or "", lines=nlines)
         else:
-            result = await self.osc.execute_safe_command(intent.command)
+            cmd = (intent.command or "").strip()
+            if cmd.startswith("sudo"):
+                # Privilegios → SIEMPRE pasa por aprobación humana en la UI.
+                approved = await self._ask_sudo_approval(cid, cmd)
+                if not approved:
+                    result = CommandResult(False, "",
+                        "el usuario rechazó la operación privilegiada", 1,
+                        0.0, cmd)
+                else:
+                    result = await self.osc.execute_safe_command(cmd)
+            else:
+                result = await self.osc.execute_safe_command(cmd)
         await self.manager.send(cid, {"type": "command_result", **result.to_dict()})
 
         if result.success:
@@ -381,6 +532,10 @@ class CilixServer:
             if detalle:
                 answer += "\n\n" + detalle
             emotion = "feliz"
+            # Hito › sugiere contenido social (la sugerencia no gasta LLM).
+            if intent.kind == "writefile":
+                answer += ("\n\n💡 Si quieres, con «haz un post sobre esto» "
+                           "te preparo el caption para #BuildInPublic.")
         else:
             answer = f"No pude completar la acción: {result.error or 'el comando falló'}"
             emotion = "triste"
@@ -483,9 +638,14 @@ class CilixServer:
         await self.manager.send(cid, {"type": "history", "messages": msgs})
 
     async def _handle_new_chat(self, cid: str) -> None:
-        """Inicia un chat nuevo: limpia la ventana en RAM del cerebro. Los
-        mensajes anteriores quedan guardados en SQLite (accesibles vía /history)."""
+        """Inicia un chat nuevo: olvida la conversación (RAM **y** SQLite de la
+        sesión actual) para que `load_history_from_memory` no reintroduzca el
+        contexto viejo. Los HECHOS del perfil (nombre, gustos) SÍ se conservan."""
         self.ai.conversation_history = []
+        try:
+            self.memory.clear_session(self.session_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("clear_session falló: %r", exc)
         await self.manager.send(cid, {"type": "new_chat_started"})
 
     def history_payload(self, limit: int = 40) -> List[Dict[str, Any]]:

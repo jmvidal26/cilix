@@ -361,3 +361,32 @@ body.browser .msg.ai { background: rgba(15,23,42,0.66); }
   0%, 100% { box-shadow: 0 0 0 0 rgba(0,245,212,0.35); }
   50%      { box-shadow: 0 0 0 8px rgba(0,245,212,0.0); }
 }
+
+/* ══ Tarjetas de aprobación humana (sudo / social) ════════════════════════
+   Flotan sobre el chat; Ri pausa la acción privilegiada hasta el clic. */
+.approval-card {
+  position: fixed; left: 50%; bottom: 96px; transform: translateX(-50%);
+  z-index: 60; width: min(420px, 92vw);
+  background: rgba(10, 18, 28, 0.92); backdrop-filter: blur(8px);
+  border: 1px solid rgba(0, 245, 212, 0.35); border-radius: 14px;
+  padding: 14px 16px; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
+  animation: card-in 0.18s ease-out;
+}
+.approval-card.hidden { display: none; }
+@keyframes card-in { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; } }
+.approval-head { font-size: 13px; margin-bottom: 8px; color: #e8f6ff; }
+.approval-cmd {
+  display: block; background: rgba(0, 0, 0, 0.45); border-radius: 8px;
+  padding: 8px 10px; margin-bottom: 10px; font-size: 12.5px;
+  color: #ffd27a; word-break: break-all; white-space: pre-wrap;
+}
+.approval-cmd.caption { color: #e8f6ff; }
+.social-tags { font-size: 11.5px; color: var(--accent); margin: -4px 0 10px; }
+.approval-actions { display: flex; gap: 8px; }
+.approval-actions button {
+  flex: 1; border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 9px;
+  padding: 7px 0; font-size: 13px; cursor: pointer;
+  background: rgba(255, 255, 255, 0.07); color: #e8f6ff;
+}
+.approval-actions .ok { background: var(--accent); color: #04121a; border: none; font-weight: 700; }
+.approval-actions .no { background: rgba(255, 80, 110, 0.16); border-color: rgba(255, 80, 110, 0.4); }
