@@ -26,12 +26,14 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 import psutil
 import uvicorn
@@ -39,13 +41,21 @@ import uvicorn
 from audio_engine import AudioEngine
 from clipboard_sentinel import ClipboardSentinel
 from command_interpreter import CommandInterpreter, Intent
+from companion import SilenceCompanion
 from config import FRONTEND_DIR, MODELS_DIR, STATIC_DIR, log_startup_summary, settings
 from core_ia import CoreIA
+from curiosity import CuriosityEngine
+from coding_bridge import CoderBridge, CoderRequest
+from edith_bridge import bridge as edith_bridge
 from memory import MemoryStore
 from os_controller import OSController, CommandResult
 from personality_engine import PersonalityEngine
+from security import origin_allowed, path_within
 from social_engine import SocialEngine
 from vista_engine import VistaEngine
+
+# Carpeta que puede abrir la tarjeta social (nada fuera de ella).
+SOCIAL_ROOT = Path.home() / "Documents" / "cilix-social"
 
 # ── Logging robusto ────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -104,6 +114,22 @@ class CilixServer:
         self.osc = OSController()
         self.memory = MemoryStore()
         self.interp = CommandInterpreter()   # lenguaje natural → acciones del SO
+        self.edith = edith_bridge             # puente con E.D.I.T.H (Le'fil)
+        self.coder = CoderBridge(             # puente con Antigravity/Qoder
+            enabled=settings.coder_enabled,
+            provider=settings.coder_provider,
+            binary=settings.coder_bin,
+            workspace=settings.coder_dir,
+            roots=settings.coder_roots,
+            mode=settings.coder_mode,
+            model=settings.coder_model,
+            sandbox=settings.coder_sandbox,
+            auto_approve=settings.coder_auto_approve,
+            timeout=settings.coder_timeout,
+            max_turns=settings.coder_max_turns,
+        )
+        self.curiosity = CuriosityEngine(engine=settings.curiosity_engine)
+        self.companion = SilenceCompanion(self.curiosity)
         # Conexión de la memoria persistente al cerebro + sesión estable: así el
         # historial y los recuerdos sobreviven a recargas (un solo usuario = un
         # hilo continuo de conversación).
@@ -112,6 +138,8 @@ class CilixServer:
         # Motor de personalidad/ánimo: sesga el prompt y decide cuándo hablar sola.
         self.personality = PersonalityEngine(self.memory)
         self.ai.attach_personality(self.personality)
+        # Curiosidades ya aprendidas de la web (persisten entre reinicios).
+        self._apply_curiosities(warm=False)
         self._last_user_ts = time.time()      # última interacción real del usuario
         self._proactive_recent: List[float] = []  # ts de los últimos impulsos
         # Agente de contenido social (Ri redacta; el humano publica).
@@ -167,14 +195,20 @@ class CilixServer:
 
         # Tarea periódica de estado + autoprotección de RAM
         self._spawn(self._status_loop())
-        # Bucle de pensamiento proactivo (Ri habla sola en idle), si está activo.
-        if settings.proactive_enabled:
+        # Compañía en silencio: niveles por tiempo de inactividad. Si está
+        # activa, sustituye al bucle proactivo clásico (evita hablar dos veces).
+        if settings.companion_enabled:
+            self._spawn(self._companion_loop())
+        elif settings.proactive_enabled:
             self._spawn(self._proactive_loop())
         # Precalentar el prefijo estático del prompt (cache KV de prefijos de
         # Ollama): el primer prefill real ahorra ~la mitad del cómputo.
         self._spawn(self.ai.warm_prefix_cache())
         # Centinela del portapapeles: detecta errores copiados y Ri ofrece ayuda.
         self._spawn(self.clipboard.run())
+        # Curiosidad autónoma: busca temas random y adopta gustos propios.
+        if settings.curiosity_enabled:
+            self._spawn(self._curiosity_loop())
 
     async def shutdown(self) -> None:
         logger.info("🧹 Apagando Cilix...")
@@ -346,6 +380,33 @@ class CilixServer:
         self.ai.extract_facts(text)
         self.memory.add_message(self.session_id, "user", text, mode)
 
+        # ¿Pide silencio o que vuelva a hablar? Se resuelve sin LLM.
+        companion_req = self.companion.interpret(text)
+        if companion_req:
+            await self._run_companion_control(cid, text, companion_req, mode)
+            return
+
+        # ¿Pide curiosear / recordar lo aprendido? Se resuelve sin LLM.
+        curiosity_req = self.curiosity.interpret(text)
+        if curiosity_req is not None:
+            await self._run_curiosity(cid, text, curiosity_req, mode)
+            return
+
+        # ¿Va dirigido a E.D.I.T.H (Le'fil)? Se resuelve antes que las
+        # acciones del SO y sin pasar por el cerebro (ahorra tokens y RAM).
+        edith_req = self.edith.interpret(text)
+        if edith_req is not None:
+            await self._run_edith(cid, text, edith_req, mode)
+            return
+
+        # ¿Pide programar algo de verdad? Se delega al agente de código
+        # (Antigravity/Qoder) en un subproceso, antes de las acciones del SO
+        # para que «crea un script…» no se confunda con «crea una carpeta».
+        coder_req = self.coder.interpret(text)
+        if coder_req is not None:
+            await self._run_coder(cid, text, coder_req, mode)
+            return
+
         # ¿Es una acción del sistema (lanzar app / comando / consultar estado)?
         # Se ejecuta de inmediato sin pasar por el cerebro.
         intent = self.interp.interpret(text)
@@ -379,6 +440,185 @@ class CilixServer:
             await self._speak(cid, answer)
 
         await self.manager.send(cid, {"type": "state", "state": "idle"})
+
+    async def _run_edith(self, cid: str, text: str,
+                         req: Tuple[str, Optional[str]], mode: str) -> None:
+        """Ejecuta una acción de E.D.I.T.H en un subproceso aislado.
+
+        El subproceso muere al terminar, así que Cilix no paga RAM por el
+        motor de pentesting ni por su analizador.
+        """
+        action, target = req
+        started = time.time()
+        data = await self.edith.run(action, target)
+        answer = self.edith.format_reply(action, data)
+        duration = round(time.time() - started, 3)
+        emotion = "concentrado" if action in ("scan", "pentest") else "neutral"
+
+        # El mensaje del usuario ya se guardó en _handle_chat.
+        self.memory.add_message(self.session_id, "assistant", answer, "Ri", emotion)
+        self.ai._add_to_history(text, answer, "Ri")
+
+        await self.manager.send(cid, {
+            "type": "response", "text": answer, "emotion": emotion,
+            "mode": "Ri", "duration": duration, "source": "edith",
+        })
+        if self.settings["voice_enabled"] and self.audio:
+            await self._speak(cid, answer)
+        await self.manager.send(cid, {"type": "state", "state": "idle"})
+
+    async def _run_coder(self, cid: str, text: str,
+                         req: CoderRequest, mode: str) -> None:
+        """Delega una tarea de código en Antigravity CLI / Qoder CLI.
+
+        El agente corre en un subproceso con su propio directorio de trabajo y
+        muere al terminar, así que Cilix no paga su RAM en reposo.
+        """
+        agent = {"agy": "Antigravity", "qoder": "Qoder"}.get(
+            self.coder.provider or "", "el agente de código")
+        # Aviso inmediato: la tarea puede tardar bastante. Se emite como globo
+        # espontáneo y se vuelve a poner el estado "thinking" justo después.
+        await self.manager.send(cid, {
+            "type": "proactive",
+            "text": f"Vale, se lo paso a {agent}. Dame un momento…",
+            "emotion": "concentrado", "mode": "Ri",
+            "mood": self.personality.mood.to_dict(),
+        })
+        await self.manager.send(cid, {"type": "state", "state": "thinking"})
+
+        data = await self.coder.run(
+            req.task, workspace=req.workspace, mode=req.mode)
+        answer = self.coder.format_reply(data)
+        emotion = "concentrado" if data.get("ok") else "neutral"
+
+        self.memory.add_message(self.session_id, "assistant", answer, "Ri", emotion)
+        self.ai._add_to_history(text, answer, "Ri")
+
+        await self.manager.send(cid, {
+            "type": "response", "text": answer, "emotion": emotion,
+            "mode": "Ri", "duration": data.get("duration", 0),
+            "source": "coder",
+        })
+        if (settings.coder_voice and self.settings["voice_enabled"]
+                and self.audio):
+            await self._speak(cid, answer)
+        await self.manager.send(cid, {"type": "state", "state": "idle"})
+
+    # ── Compañía en silencio (habla sola si no interactúas) ────────────────
+    async def _run_companion_control(self, cid: str, text: str,
+                                     action: str, mode: str) -> None:
+        if action == "pause":
+            self.companion.pause(30)
+            answer = ("Vale, me quedo calladita 30 minutos. Si me necesitas, "
+                      "escríbeme y vuelvo al momento.")
+        else:
+            self.companion.resume()
+            answer = "Vuelvo a estar por aquí. Te escucho cuando quieras."
+        self.memory.add_message(self.session_id, "assistant", answer, "Ri", "neutral")
+        self.ai._add_to_history(text, answer, "Ri")
+        await self.manager.send(cid, {
+            "type": "response", "text": answer, "emotion": "neutral",
+            "mode": "Ri", "source": "companion",
+        })
+        if self.settings["voice_enabled"] and self.audio:
+            await self._speak(cid, answer)
+        await self.manager.send(cid, {"type": "state", "state": "idle"})
+
+    async def _companion_loop(self) -> None:
+        """Habla sola tras 5/15/40 min de silencio, con topes y horas quietas."""
+        await asyncio.sleep(20)   # dejar arrancar el resto del sistema
+        while True:
+            try:
+                await asyncio.sleep(10)
+                if self._memory_critical():
+                    continue
+                moment = self.companion.due(time.time(), self._last_user_ts)
+                if moment is None:
+                    continue
+                try:
+                    resp = await asyncio.wait_for(
+                        self.ai.proactive_turn(moment.seed), timeout=75)
+                except asyncio.TimeoutError:
+                    logger.debug("Compañía: el cerebro tardó demasiado; silencio")
+                    continue
+                answer = (resp.get("response") or "").strip()
+                if not answer:
+                    continue
+                emotion = resp.get("emotion", "neutral")
+                self.companion.mark_spoke()
+                self.memory.add_message(self.session_id, "assistant", answer,
+                                        "Ri", emotion)
+                await self.manager.broadcast({
+                    "type": "proactive", "text": answer, "emotion": emotion,
+                    "mode": "Ri", "tier": moment.tier,
+                    "mood": self.personality.mood.to_dict(),
+                })
+                if (self.companion.voice and self.settings["voice_enabled"]
+                        and self.audio):
+                    await self._speak_broadcast(answer)
+                logger.info("🗣️ Compañía (%s · %d s de silencio): %s",
+                            moment.tier, int(moment.idle), answer[:90])
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Compañía: fallo silencioso (%r)", exc)
+
+    # ── Curiosidad (busca temas random y adopta gustos) ────────────────────
+    def _apply_curiosities(self, warm: bool = True) -> None:
+        """Vuelca los últimos hallazgos en la capa de voz (prompt)."""
+        if not self.ai.voice:
+            return
+        topics, opinion = self.curiosity.persona_hint()
+        self.ai.voice.set_curiosities(topics, opinion)
+        if warm:
+            # La línea de curiosidad va en la parte variable del prompt: no
+            # invalida la caché KV, así que no hace falta recalcular nada.
+            logger.debug("Curiosidad aplicada: %s | %s", topics, opinion)
+
+    async def _run_curiosity(self, cid: str, text: str,
+                             req: Tuple[str, Optional[str]], mode: str) -> None:
+        kind, topic = req
+        started = time.time()
+        if kind == "recall":
+            answer = self.curiosity.recall_reply()
+            record = None
+        else:
+            try:
+                record = await asyncio.wait_for(self.curiosity.learn(topic), timeout=32)
+            except asyncio.TimeoutError:
+                record = None
+            answer = self.curiosity.format_reply(record)
+            self._apply_curiosities()
+
+        duration = round(time.time() - started, 3)
+        self.memory.add_message(self.session_id, "assistant", answer, "Ri", "curioso")
+        self.ai._add_to_history(text, answer, "Ri")
+        await self.manager.send(cid, {
+            "type": "response", "text": answer, "emotion": "curioso",
+            "mode": "Ri", "duration": duration, "source": "curiosity",
+        })
+        if self.settings["voice_enabled"] and self.audio:
+            await self._speak(cid, answer)
+        await self.manager.send(cid, {"type": "state", "state": "idle"})
+
+    async def _curiosity_loop(self) -> None:
+        """Aprende un tema al azar cuando la casa está en calma."""
+        interval = max(300, int(settings.curiosity_interval))
+        idle_needed = max(120, int(settings.curiosity_idle))
+        await asyncio.sleep(min(300, interval))   # no nada más arrancar
+        while True:
+            try:
+                if time.time() - self._last_user_ts >= idle_needed:
+                    record = await asyncio.wait_for(self.curiosity.learn(), timeout=32)
+                    if record:
+                        self._apply_curiosities()
+                        logger.info("🔎 Curiosidad autónoma: %s (%s)",
+                                    record.get("short"), record.get("source"))
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Curiosidad autónoma falló: %r", exc)
+            await asyncio.sleep(interval)
 
     def _intent_from_action(self, action: Dict[str, str]) -> Optional[Intent]:
         """Convierte el JSON del fallback LLM en una Intent ejecutable.
@@ -460,11 +700,24 @@ class CilixServer:
         await self.manager.send(cid, {"type": "state", "state": "idle"})
 
     async def _handle_social_action(self, cid: str, data: Dict[str, Any]) -> None:
-        """Acciones de la tarjeta social: abrir la carpeta del borrador."""
-        if data.get("action") == "open":
-            path = (data.get("path") or "").strip()
-            if path:
-                await self.osc.execute_safe_command(f"xdg-open {path}")
+        """Acciones de la tarjeta social: abrir la carpeta del borrador.
+
+        La ruta la manda el cliente, así que se confina a
+        `~/Documents/cilix-social` y se abre sin shell. Antes bastaba un
+        `path: "x; rm -rf ~"` para inyectar un comando en el backend.
+        """
+        if data.get("action") != "open":
+            return
+        target = path_within(data.get("path") or "", SOCIAL_ROOT)
+        if target is None:
+            await self.manager.send(cid, {
+                "type": "error",
+                "message": "Ruta no permitida (solo la carpeta de borradores)",
+            })
+            return
+        if not await self.osc.open_path(str(target)):
+            await self.manager.send(cid, {
+                "type": "error", "message": "No pude abrir la carpeta del borrador"})
 
     async def _on_clip_error(self, snippet: str) -> None:
         """ClipboardSentinel → Ri ofrece ayuda proactiva al ver un error copiado.
@@ -669,17 +922,40 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="Cilix Server",
     description="Asistente de escritorio VTuber · Cerebro Dual local (Ollama)",
-    version="2.0",
+    version="2.1",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    # Solo la propia interfaz (navegador local o Electron). Con "*" cualquier
+    # web podía leer las rutas HTTP del backend desde el navegador.
+    allow_origins=[
+        f"http://127.0.0.1:{settings.port}",
+        f"http://localhost:{settings.port}",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def guard_local_writes(request, call_next):
+    """Bloquea escrituras HTTP con `Origin` externo.
+
+    CORS solo impide LEER la respuesta, no enviar la petición (un POST
+    "simple" no lleva preflight). Esto cierra esa vía para `/api/*` sin
+    afectar al MCP ni a scripts locales (que no mandan `Origin`).
+    """
+    if (request.url.path.startswith("/api/")
+            and request.method not in ("GET", "HEAD", "OPTIONS")):
+        origin = request.headers.get("origin")
+        if not origin_allowed(origin):
+            logger.warning("🚫 API rechazada (Origin no local): %r", origin)
+            return JSONResponse(
+                {"ok": False, "error": "Origen no permitido"}, status_code=403)
+    return await call_next(request)
 
 # Montaje de estáticos: librerías Live2D, assets del frontend y modelos
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -702,11 +978,14 @@ async def health() -> JSONResponse:
     return JSONResponse({
         "status": "healthy",
         "service": "Cilix Server",
-        "version": "2.0",
+        "version": "2.1",
         "local_only": True,
         "timestamp": time.time(),
         "ram_percent": server._ram_percent(),
         "connections": len(server.manager.active),
+        # El cerebro activo se ve desde fuera (run.sh y MCP lo consultan).
+        "brain": "opencode" if server.ai.online is not None else "ollama",
+        "online": server.ai.online is not None,
     })
 
 
@@ -733,9 +1012,279 @@ async def history(limit: int = 80) -> JSONResponse:
     })
 
 
+# ── API REST para el agente (MCP) ──────────────────────────────────────────
+# El servidor MCP (`mcp_server.py`) y cualquier script local pueden hacer que
+# Cilix hable o cambie de cara sin pasar por el WebSocket del navegador.
+class SayPayload(BaseModel):
+    text: str
+    emotion: str = "neutral"
+    speak: bool = True
+
+
+class EmotionPayload(BaseModel):
+    emotion: str = "neutral"
+
+
+class AskPayload(BaseModel):
+    text: str
+    speak: bool = False
+
+
+class RememberPayload(BaseModel):
+    key: str
+    value: str
+
+
+class EdithPayload(BaseModel):
+    action: str = "status"      # status | devices | scan | pentest
+    target: str = ""            # IP privada (solo pentest)
+    speak: bool = False
+
+
+VALID_EDITH_ACTIONS = {"status", "devices", "scan", "pentest"}
+
+
+class CoderPayload(BaseModel):
+    task: str = ""
+    workspace: str = ""         # vacío = proyecto por defecto
+    mode: str = ""              # plan | accept-edits | auto
+    timeout: float = 0          # 0 = CILIX_CODER_TIMEOUT
+    speak: bool = False
+
+
+class CuriosityPayload(BaseModel):
+    topic: str = ""             # vacío = tema al azar
+    speak: bool = False
+
+
+class CompanionPayload(BaseModel):
+    action: str = "status"      # status | pause | resume
+    minutes: int = 30
+
+
+VALID_EMOTIONS = {"neutral", "feliz", "triste", "enfadado", "sorprendido",
+                  "concentrado"}
+
+
+@app.post("/api/say")
+async def api_say(payload: SayPayload) -> JSONResponse:
+    """Hace que Cilix diga un texto ya escrito (voz + globo + emoción).
+
+    No consulta al cerebro: es el canal de SALIDA que usa el agente cuando
+    quiere hablar por ella. Coste: solo el TTS.
+    """
+    text = (payload.text or "").strip()
+    if not text:
+        return JSONResponse({"ok": False, "error": "texto vacío"}, status_code=400)
+    emotion = payload.emotion if payload.emotion in VALID_EMOTIONS else "neutral"
+    await server.manager.broadcast({
+        "type": "proactive", "text": text, "emotion": emotion, "mode": "Ri",
+        "mood": server.personality.mood.to_dict(),
+    })
+    spoken = False
+    if payload.speak and server.settings["voice_enabled"] and server.audio:
+        await server._speak_broadcast(text)
+        spoken = True
+    server.memory.add_message(server.session_id, "assistant", text, "Ri", emotion)
+    return JSONResponse({"ok": True, "spoken": spoken, "emotion": emotion})
+
+
+@app.post("/api/emotion")
+async def api_emotion(payload: EmotionPayload) -> JSONResponse:
+    """Cambia la cara del avatar sin hablar (gesto del agente)."""
+    emotion = payload.emotion if payload.emotion in VALID_EMOTIONS else "neutral"
+    await server.manager.broadcast({"type": "emotion", "emotion": emotion})
+    return JSONResponse({"ok": True, "emotion": emotion})
+
+
+@app.post("/api/remember")
+async def api_remember(payload: RememberPayload) -> JSONResponse:
+    """Guarda un hecho persistente del usuario desde el agente/MCP."""
+    key = (payload.key or "").strip()
+    value = (payload.value or "").strip()
+    if not key or not value:
+        return JSONResponse(
+            {"ok": False, "error": "key y value son obligatorios"},
+            status_code=400)
+    server.memory.remember_fact(key, value)
+    return JSONResponse({"ok": True, "key": key, "value": value})
+
+
+@app.post("/api/ask")
+async def api_ask(payload: AskPayload) -> JSONResponse:
+    """Responde una pregunta sin pasar por el WebSocket (canal del agente).
+
+    Útil para el agente/MCP y para pruebas automatizadas del pipeline.
+    """
+    text = (payload.text or "").strip()
+    if not text:
+        return JSONResponse({"ok": False, "error": "texto vacío"}, status_code=400)
+    server.ai.load_history_from_memory(server.session_id)
+    server.ai.extract_facts(text)
+    server.memory.add_message(server.session_id, "user", text, "Ri")
+    resp = await server.ai.process_message(text, "Ri")
+    answer = resp.get("response", "")
+    emotion = resp.get("emotion", "neutral")
+    server.personality.on_interaction(text, emotion)
+    server.memory.add_message(server.session_id, "assistant", answer, "Ri", emotion)
+    await server.manager.broadcast({
+        "type": "response", "text": answer, "emotion": emotion, "mode": "Ri",
+        "duration": resp.get("duration", 0),
+    })
+    if payload.speak and server.settings["voice_enabled"] and server.audio:
+        await server._speak_broadcast(answer)
+    return JSONResponse({
+        "ok": True, "response": answer, "emotion": emotion,
+        "duration": resp.get("duration", 0), "mode": resp.get("mode", "Ri"),
+    })
+
+
+@app.post("/api/edith")
+async def api_edith(payload: EdithPayload) -> JSONResponse:
+    """Ejecuta una acción de E.D.I.T.H (Le'fil) y devuelve la frase + datos.
+
+    Canal para agentes/automatización sin pasar por el WebSocket. El motor de
+    E.D.I.T.H corre en un subproceso que muere al terminar: 0 RAM en reposo.
+    """
+    action = (payload.action or "status").strip().lower()
+    if action not in VALID_EDITH_ACTIONS:
+        return JSONResponse(
+            {"ok": False, "error": f"acción no válida: {action}"}, status_code=400)
+    data = await server.edith.run(action, (payload.target or "").strip() or None)
+    reply = server.edith.format_reply(action, data)
+    emotion = "concentrado" if action in ("scan", "pentest") else "neutral"
+    server.memory.add_message(server.session_id, "assistant", reply, "Ri", emotion)
+    await server.manager.broadcast({
+        "type": "response", "text": reply, "emotion": emotion,
+        "mode": "Ri", "source": "edith",
+    })
+    if payload.speak and server.settings["voice_enabled"] and server.audio:
+        await server._speak_broadcast(reply)
+    return JSONResponse({
+        "ok": bool(data.get("ok")), "reply": reply,
+        "emotion": emotion, "data": data,
+    })
+
+
+@app.post("/api/coder")
+async def api_coder(payload: CoderPayload) -> JSONResponse:
+    """Delega una tarea de programación a Antigravity CLI o Qoder CLI.
+
+    El agente corre como subproceso en el proyecto indicado y muere al
+    terminar: Cilix no paga su RAM en reposo. Canal para agentes/MCP y para
+    automatización sin pasar por el WebSocket.
+    """
+    task = (payload.task or "").strip()
+    if not task:
+        return JSONResponse(
+            {"ok": False, "error": "falta la tarea de programación"},
+            status_code=400)
+    data = await server.coder.run(
+        task,
+        workspace=(payload.workspace or "").strip() or None,
+        mode=(payload.mode or "").strip() or None,
+        timeout=payload.timeout or None,
+    )
+    reply = server.coder.format_reply(data)
+    emotion = "concentrado" if data.get("ok") else "neutral"
+    server.memory.add_message(server.session_id, "assistant", reply, "Ri", emotion)
+    await server.manager.broadcast({
+        "type": "response", "text": reply, "emotion": emotion,
+        "mode": "Ri", "source": "coder",
+        "duration": data.get("duration", 0),
+    })
+    if payload.speak and server.settings["voice_enabled"] and server.audio:
+        await server._speak_broadcast(reply)
+    return JSONResponse({
+        "ok": bool(data.get("ok")), "reply": reply,
+        "emotion": emotion, "data": data,
+    })
+
+
+@app.get("/api/coder")
+async def api_coder_status() -> JSONResponse:
+    """Estado del puente de programación (proveedor, proyecto y permisos)."""
+    return JSONResponse({"ok": True, "coder": server.coder.status()})
+
+
+@app.post("/api/curiosity")
+async def api_curiosity(payload: CuriosityPayload) -> JSONResponse:
+    """Busca un tema (o uno al azar), aprende y devuelve la frase + hallazgo.
+
+    No usa el LLM: una petición HTTP y una plantilla. La personalidad cambia
+    porque el hallazgo se inyecta desde ese momento en el prompt de Ri.
+    """
+    topic = (payload.topic or "").strip() or None
+    try:
+        record = await asyncio.wait_for(server.curiosity.learn(topic), timeout=32)
+    except asyncio.TimeoutError:
+        record = None
+    reply = server.curiosity.format_reply(record)
+    server._apply_curiosities()
+    server.memory.add_message(server.session_id, "assistant", reply, "Ri", "curioso")
+    await server.manager.broadcast({
+        "type": "response", "text": reply, "emotion": "curioso",
+        "mode": "Ri", "source": "curiosity",
+    })
+    if payload.speak and server.settings["voice_enabled"] and server.audio:
+        await server._speak_broadcast(reply)
+    topics, opinion = server.curiosity.persona_hint()
+    return JSONResponse({
+        "ok": bool(record), "reply": reply, "record": record,
+        "personality": {"interests": topics, "opinion": opinion},
+    })
+
+
+@app.get("/api/companion")
+async def api_companion_state() -> JSONResponse:
+    """Estado del módulo de compañía (pausa, topes, horas de silencio)."""
+    return JSONResponse({"ok": True, "companion": server.companion.status()})
+
+
+@app.post("/api/companion")
+async def api_companion(payload: CompanionPayload) -> JSONResponse:
+    """Pausa, reanuda o consulta la voz espontánea de Cilix."""
+    action = (payload.action or "status").strip().lower()
+    if action == "pause":
+        server.companion.pause(payload.minutes)
+    elif action == "resume":
+        server.companion.resume()
+    elif action != "status":
+        return JSONResponse({"ok": False,
+                             "error": "acción no válida: status|pause|resume"},
+                            status_code=400)
+    return JSONResponse({"ok": True, "companion": server.companion.status()})
+
+
+@app.get("/api/state")
+async def api_state() -> JSONResponse:
+    """Estado compacto para el agente: RAM, ánimo, cerebro y conexiones."""
+    online = {"enabled": False}
+    if server.ai.online is not None:
+        online = {"enabled": True, **(await server.ai.online.health())}
+    return JSONResponse({
+        "ram_percent": server._ram_percent(),
+        "connections": len(server.manager.active),
+        "mood": server.personality.mood.to_dict(),
+        "mode": server.ai.active_mode.value,
+        "brain": "opencode" if server.ai.online is not None else "ollama",
+        "ai": server.ai.get_stats(),
+        "online": online,
+        "coder": server.coder.status(),
+    })
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     """Canal principal en tiempo real para la interfaz."""
+    # CORS no protege los WebSockets: sin esta comprobación, cualquier página
+    # abierta en el navegador podía conectar a ws://127.0.0.1:8765 y mandar
+    # `command` al controlador del sistema.
+    origin = ws.headers.get("origin")
+    if not origin_allowed(origin):
+        logger.warning("🚫 WebSocket rechazado (Origin no local): %r", origin)
+        await ws.close(code=1008)
+        return
     cid = await server.manager.connect(ws)
     await server.manager.send(cid, {
         "type": "connected", "client_id": cid, "state": "idle",

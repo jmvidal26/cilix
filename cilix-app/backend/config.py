@@ -91,10 +91,12 @@ class Settings:
 
     # ── Ajuste fino de RAM en Ollama (la mayor palanca de ahorro) ────────────
     # num_ctx pequeño reduce drásticamente la caché KV (RAM por conversación).
-    ollama_num_ctx: int = _env("CILIX_OLLAMA_NUM_CTX", 1024)
+    # 768 basta para el prompt recortado (~400 tokens) + respuesta corta.
+    ollama_num_ctx: int = _env("CILIX_OLLAMA_NUM_CTX", 768)
     ollama_num_batch: int = _env("CILIX_OLLAMA_NUM_BATCH", 128)
-    # Tokens máximos de salida (antes 512). Menos = menos RAM y más rápido.
-    ri_num_predict: int = _env("CILIX_RI_NUM_PREDICT", 220)
+    # Tokens máximos de salida (antes 220). Cilix habla en 1-3 frases: 110
+    # sobra y recorta la latencia en CPU (cada token ~0,12 s).
+    ri_num_predict: int = _env("CILIX_RI_NUM_PREDICT", 55)
     re_num_predict: int = _env("CILIX_RE_NUM_PREDICT", 400)
     # use_mmap=True mapea el modelo a disco en vez de cargarlo entero en RAM.
     ollama_use_mmap: bool = _env("CILIX_OLLAMA_USE_MMAP", True)
@@ -142,9 +144,71 @@ class Settings:
     proactive_quiet_end: int = _env("CILIX_PROACTIVE_QUIET_END", 8)
     proactive_voice: bool = _env("CILIX_PROACTIVE_VOICE", True)          # texto + voz
 
+    # ── Curiosidad autónoma (busca temas random y aprende) ─────────────────
+    # Cada `curiosity_interval` segundos, si llevas `curiosity_idle` sin hablar,
+    # Cilix busca un tema al azar y lo convierte en gusto/opinión propia.
+    curiosity_enabled: bool = _env("CILIX_CURIOSITY", True)
+    curiosity_interval: int = _env("CILIX_CURIOSITY_INTERVAL", 1800)   # 30 min
+    curiosity_idle: int = _env("CILIX_CURIOSITY_IDLE", 600)            # 10 min
+    # auto = Google → Bing → Wikipedia | google | bing | wikipedia
+    curiosity_engine: str = _env("CILIX_CURIOSITY_ENGINE", "auto")
+
+    # ── Compañía en silencio (habla sola si NO interactúas) ─────────────────
+    # Niveles: 5 min saludo · 15 min curiosidad · 40 min charla · luego calla.
+    # Sustituye al bucle proactivo clásico cuando está activo (evita duplicados).
+    companion_enabled: bool = _env("CILIX_COMPANION", True)
+    companion_idle: int = _env("CILIX_COMPANION_IDLE", 300)            # 5 min
+    companion_repeat: int = _env("CILIX_COMPANION_REPEAT", 900)        # 15 min
+    companion_max_per_hour: int = _env("CILIX_COMPANION_MAX_HOUR", 3)  # tope/hora
+    companion_quiet_start: int = _env("CILIX_COMPANION_QUIET_START", 23)
+    companion_quiet_end: int = _env("CILIX_COMPANION_QUIET_END", 8)
+    companion_voice: bool = _env("CILIX_COMPANION_VOICE", True)
+
     # ── Percepción / control ────────────────────────────────────────────────
     vision_enabled: bool = _env("CILIX_VISION_ENABLED", False)      # OFF por defecto (RAM)
     voice_enabled: bool = _env("CILIX_VOICE_ENABLED", True)
+
+    # ── Modo ONLINE (cerebro = servidor local de OpenCode) ──────────────────
+    # false = 100% local con Ollama (comportamiento histórico).
+    # true  = las respuestas las genera OpenCode por su API local (sin APIs de
+    #         pago y sin otro proveedor). Si OpenCode no está disponible y
+    #         online_fallback está activo, se cae a Ollama automáticamente.
+    online_mode: bool = _env("CILIX_ONLINE", False)
+    online_fallback: bool = _env("CILIX_ONLINE_FALLBACK", True)
+    # URL del servidor; vacío = se descubre con `opencode service status`.
+    opencode_url: str = _env("CILIX_OPENCODE_URL", "")
+    # Password de ~/.config/opencode/service.json; vacío = se lee del archivo.
+    opencode_password: str = _env("CILIX_OPENCODE_PASSWORD", "")
+    # Sesión dedicada de Cilix dentro de OpenCode (se reutiliza/crea).
+    opencode_session: str = _env("CILIX_OPENCODE_SESSION", "Cilix · voz")
+    # Modelo de esa sesión, formato "proveedor/modelo". Vacío = el de OpenCode.
+    opencode_model: str = _env("CILIX_OPENCODE_MODEL", "")
+    # Timeout de una respuesta online (el modelo puede tardar en CPU/red).
+    opencode_timeout: float = _env("CILIX_OPENCODE_TIMEOUT", 120.0)
+
+    # ── Programación delegada (Antigravity CLI / Qoder CLI) ────────────────
+    # Cilix puede pasar una tarea de código a un agente externo en modo
+    # headless. El agente corre como subproceso: 0 RAM en reposo.
+    coder_enabled: bool = _env("CILIX_CODER_ENABLED", True)
+    # auto = Antigravity si está instalado; si no, Qoder.
+    coder_provider: str = _env("CILIX_CODER_PROVIDER", "auto")
+    # Binario explícito (vacío = buscar `agy` / `qoder` en el PATH).
+    coder_bin: str = _env("CILIX_CODER_BIN", "")
+    # Proyecto por defecto (vacío = ~/partes/Le-fil si existe).
+    coder_dir: str = _env("CILIX_CODER_DIR", "")
+    # Carpetas donde se permite programar (separadas por ':').
+    coder_roots: str = _env(
+        "CILIX_CODER_ROOTS", "~/partes:~/Documents:~/Downloads/cilix")
+    # plan = solo analiza | accept-edits = edita archivos sin pedir permiso.
+    coder_mode: str = _env("CILIX_CODER_MODE", "accept-edits")
+    coder_model: str = _env("CILIX_CODER_MODEL", "")
+    # El sandbox del CLI limita los comandos al proyecto y bloquea ~/.ssh.
+    coder_sandbox: bool = _env("CILIX_CODER_SANDBOX", True)
+    # true = aprobar todo automáticamente (siempre dentro del sandbox).
+    coder_auto_approve: bool = _env("CILIX_CODER_AUTO", False)
+    coder_timeout: int = _env("CILIX_CODER_TIMEOUT", 600)
+    coder_max_turns: int = _env("CILIX_CODER_MAX_TURNS", 30)
+    coder_voice: bool = _env("CILIX_CODER_VOICE", False)
 
     # ── Modo desarrollo ─────────────────────────────────────────────────────
     dev_mode: bool = _env("CILIX_DEV", False)
@@ -159,8 +223,12 @@ class Settings:
             "vision_enabled": self.vision_enabled,
             "ram_limit_gb": self.total_ram_limit_gb,
             "dev_mode": self.dev_mode,
+            "online_mode": self.online_mode,
             "proactive_enabled": self.proactive_enabled,
             "proactive_voice": self.proactive_voice,
+            "coder_enabled": self.coder_enabled,
+            "coder_provider": self.coder_provider,
+            "coder_mode": self.coder_mode,
         }
 
 
@@ -185,7 +253,14 @@ def log_startup_summary() -> None:
     logger.info(f"   Límite RAM     : {settings.total_ram_limit_gb} GB "
                 f"(crítico {settings.ram_critical_percent}%)")
     logger.info(f"   Visión         : {'ON' if settings.vision_enabled else 'OFF'}")
+    if settings.online_mode:
+        logger.info(f"   Cerebro ONLINE : OpenCode ({settings.opencode_url or 'auto'}) "
+                    f"· sesión '{settings.opencode_session}'")
     logger.info(f"   Proactividad   : {'ON' if settings.proactive_enabled else 'OFF'} "
                 f"(idle {settings.proactive_idle_seconds}s · voz "
                 f"{'ON' if settings.proactive_voice else 'OFF'})")
+    if settings.coder_enabled:
+        logger.info(f"   Programación   : {settings.coder_provider} "
+                    f"(modo {settings.coder_mode} · sandbox "
+                    f"{'ON' if settings.coder_sandbox else 'OFF'})")
     logger.info("   100% LOCAL / OFFLINE · Sin APIs de pago")

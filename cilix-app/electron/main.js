@@ -13,6 +13,9 @@ const { spawn } = require('child_process');
 const IS_DEV = process.argv.includes('--dev') || process.env.NODE_ENV === 'development';
 const PORT = parseInt(process.env.CILIX_PORT || '8765', 10);
 const BACKEND_URL = `http://127.0.0.1:${PORT}`;
+// `run.sh --app` con un backend ya arrancado evita lanzar un segundo Python
+// que chocaría por el puerto (y entraría en bucle de reintentos).
+const NO_BACKEND = process.env.CILIX_NO_BACKEND === '1';
 
 const ROOT_DIR = path.join(__dirname, '..');
 const BACKEND_DIR = path.join(ROOT_DIR, 'backend');
@@ -26,7 +29,7 @@ let pythonProcess = null;
 
 // ── Backend Python como proceso hijo ──────────────────────────────────────────
 function startPythonBackend() {
-  if (pythonProcess) return;
+  if (NO_BACKEND || pythonProcess) return;
 
   const args = [path.join(BACKEND_DIR, 'main.py')];
   if (IS_DEV) args.push('--dev');
@@ -132,6 +135,15 @@ function createMainWindow() {
     return { action: 'allow' };
   });
 
+  // La ventana no debe navegar fuera de la interfaz local (un enlace podría
+  // convertir el overlay en una página remota con acceso al preload).
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith(BACKEND_URL)) {
+      event.preventDefault();
+      if (url.startsWith('http')) shell.openExternal(url);
+    }
+  });
+
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
@@ -186,7 +198,7 @@ app.whenReady().then(async () => {
   if (app.isPackaged) app.setLoginItemSettings && app.setLoginItemSettings({ openAtLogin: false });
 
   setupIpc();
-  startPythonBackend();
+  if (!NO_BACKEND) startPythonBackend();
 
   const ready = await waitForBackend();
   if (!ready) {

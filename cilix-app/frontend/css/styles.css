@@ -283,7 +283,8 @@ body.thinking .dot { background: var(--accent); animation: blink 1s infinite; }
    se aplican cuando <html class="browser"> (lo añade app.js si no hay cilix).
    ══════════════════════════════════════════════════════════════════════════ */
 html.browser, body.browser {
-  background: linear-gradient(160deg, #070c17 0%, #0b1426 45%, #091020 100%);
+  /* `!important` para ganar a la regla base `html, body { background: transparent !important }` */
+  background: linear-gradient(160deg, #070c17 0%, #0b1426 45%, #091020 100%) !important;
 }
 /* Aurora animada tras el avatar (muy barata: 2 capas fijas, sin JS). */
 body.browser::before {
@@ -390,3 +391,144 @@ body.browser .msg.ai { background: rgba(15,23,42,0.66); }
 }
 .approval-actions .ok { background: var(--accent); color: #04121a; border: none; font-weight: 700; }
 .approval-actions .no { background: rgba(255, 80, 110, 0.16); border-color: rgba(255, 80, 110, 0.4); }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Actividades de aburrimiento (idle_activities.js)
+   Panel de vidrio que aparece junto al avatar: libreta, editor o garabato.
+   ══════════════════════════════════════════════════════════════════════════ */
+.idle-card {
+  position: fixed;
+  z-index: 13;
+  padding: 9px 12px 8px;
+  background: var(--glass);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  animation: idle-in 0.28s ease;
+  pointer-events: auto;
+}
+.idle-card.hidden { display: none; }
+@keyframes idle-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to   { opacity: 1; transform: none; }
+}
+.idle-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-bottom: 6px;
+}
+.idle-title {
+  font-family: var(--mono);
+  font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--accent);
+}
+.idle-close {
+  width: 20px; height: 20px; line-height: 1;
+  border: none; border-radius: 7px; cursor: pointer;
+  background: rgba(233,238,247,0.08);
+  color: var(--text-dim); font-size: 11px;
+  transition: background 0.2s, color 0.2s;
+}
+.idle-close:hover { background: rgba(255,45,120,0.25); color: var(--text); }
+.idle-foot {
+  margin-top: 5px;
+  font-size: 10.5px; color: var(--text-dim);
+  font-family: var(--mono);
+}
+.idle-foot:empty { display: none; }
+
+/* Libreta de notas */
+.idle-paper {
+  min-height: 82px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background:
+    repeating-linear-gradient(
+      to bottom,
+      rgba(0, 245, 212, 0.08) 0px,
+      rgba(0, 245, 212, 0.08) 1px,
+      transparent 1px,
+      transparent 23px
+    ),
+    rgba(4, 10, 18, 0.42);
+  border: 1px solid rgba(0, 245, 212, 0.14);
+}
+.idle-typed {
+  font-family: var(--mono);
+  font-size: 11.5px; line-height: 21px;
+  color: #dbe4f2; white-space: pre-wrap; word-break: break-word;
+  min-height: 63px;
+}
+.caret {
+  display: inline-block;
+  width: 7px; height: 13px;
+  margin-left: 2px; vertical-align: -2px;
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(0, 245, 212, 0.6);
+  animation: caret-blink 1s steps(1) infinite;
+}
+.caret.blink-slow { animation-duration: 1.7s; }
+@keyframes caret-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+/* Mini editor de código */
+.idle-code {
+  height: 110px; overflow: hidden;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(4, 10, 18, 0.66);
+  border: 1px solid rgba(123, 92, 255, 0.22);
+  font-family: var(--mono);
+  font-size: 10.5px; line-height: 1.55;
+  color: #cfe2f5;
+  white-space: pre;
+  text-align: left;
+}
+.code-line { display: inline-block; min-height: 1em; }
+.tok-kw  { color: #9c8bff; font-weight: 600; }
+.tok-str { color: var(--accent); }
+.tok-com { color: #67788f; font-style: italic; }
+.tok-num { color: #ffd166; }
+
+/* Garabato */
+.idle-canvas {
+  display: block;
+  width: 100%; height: auto;
+  border-radius: 10px;
+  background:
+    radial-gradient(circle at 50% 45%, rgba(123,92,255,0.14), transparent 70%),
+    rgba(4, 10, 18, 0.5);
+  border: 1px solid rgba(123, 92, 255, 0.2);
+}
+
+/* Paseo: tarjeta compacta + pastilla de estado */
+.idle-card.walk { padding: 9px 13px; }
+.idle-card.walk .idle-body { display: none; }
+.idle-card.walk .idle-head { margin-bottom: 0; }
+.idle-pill {
+  position: fixed;
+  left: 50%; top: 54px;
+  transform: translateX(-50%);
+  z-index: 9;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: var(--glass);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  color: var(--text-dim);
+  font-family: var(--mono); font-size: 10.5px;
+  animation: idle-in 0.25s ease;
+}
+.idle-pill.hidden { display: none; }
+
+@media (max-width: 700px) {
+  .idle-card {
+    left: 16px !important;
+    top: 66px !important;
+    max-width: calc(100vw - 32px);
+  }
+}

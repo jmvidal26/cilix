@@ -11,7 +11,11 @@
   'use strict';
 
   // Modo navegador (sin puente de Electron): marca <html> para lucir fondo propio.
-  if (!window.cilix) document.documentElement.classList.add('browser');
+  if (!window.cilix) {
+    // El CSS usa `html.browser` (fondo) y `body.browser` (aurora y paneles).
+    document.documentElement.classList.add('browser');
+    document.body.classList.add('browser');
+  }
 
   // ── Referencias de DOM ────────────────────────────────────────────────────
   const $ = (id) => document.getElementById(id);
@@ -76,7 +80,16 @@
       scheduleReconnect();
     };
     state.ws.onerror = () => { /* onclose gestiona la reconexión */ };
-    state.ws.onmessage = (ev) => handleMessage(JSON.parse(ev.data));
+    state.ws.onmessage = (ev) => {
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch (err) {
+        console.warn('[WS] mensaje no JSON ignorado:', err);
+        return;
+      }
+      handleMessage(msg);
+    };
   }
 
   function scheduleReconnect() {
@@ -107,11 +120,15 @@
 
       case 'state':
         setState(msg.state);
+        if (window.IdleActivities) {
+          window.IdleActivities.setBusy(msg.state !== 'idle');
+        }
         break;
 
       case 'response':
         setState('idle');
         addMessage('ai', msg.text, msg.mode);
+        if (window.IdleActivities) window.IdleActivities.touch();
         if (window.CilixAvatar) window.CilixAvatar.setEmotion(msg.emotion || 'neutral');
         break;
 
@@ -119,12 +136,23 @@
         // Ri habla sola: globo especial + emoción (el audio llega aparte por 'speak').
         setState('idle');
         addProactiveMessage(msg.text);
+        if (window.IdleActivities) window.IdleActivities.touch();
         if (window.CilixAvatar) window.CilixAvatar.setEmotion(msg.emotion || 'neutral');
         if (msg.mood) renderMood(msg.mood);
         break;
 
+      case 'emotion':
+        // Gesto del agente vía /api/emotion (cambia la cara sin hablar).
+        if (window.CilixAvatar) window.CilixAvatar.setEmotion(msg.emotion || 'neutral');
+        break;
+
       case 'speak':
         playSpeech(msg);
+        break;
+
+      case 'emotion':
+        // El agente (vía MCP) cambia la cara sin decir nada.
+        if (window.CilixAvatar) window.CilixAvatar.setEmotion(msg.emotion || 'neutral');
         break;
 
       case 'stt_result':
@@ -167,6 +195,7 @@
 
       case 'error':
         setState('idle');
+        if (window.IdleActivities) window.IdleActivities.setBusy(false);
         addMessage('sys', '⚠️ ' + (msg.message || 'Error'));
         break;
 
@@ -195,6 +224,12 @@
     addMessage('user', text);
     els.input.value = '';
     setState('thinking');
+    // Si pide una actividad de aburrimiento («dibuja», «camina»…), empieza ya;
+    // la respuesta normal del cerebro llega después sin pisarla.
+    if (window.IdleActivities) {
+      window.IdleActivities.touch();
+      window.IdleActivities.fromText(text);
+    }
     send({ type: 'chat', text, mode: state.mode });
   }
 
@@ -314,7 +349,12 @@
       const bytes = Uint8Array.from(atob(msg.audio), (c) => c.charCodeAt(0));
       const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
 
-      if (state.currentAudio) { try { state.currentAudio.pause(); } catch (_) {} }
+      if (state.currentAudio) {
+        try {
+          state.currentAudio.pause();
+          if (state.currentAudio.src) URL.revokeObjectURL(state.currentAudio.src);
+        } catch (_) { /* ya liberado */ }
+      }
       const audio = new Audio(url);
       state.currentAudio = audio;
 
@@ -328,7 +368,10 @@
         URL.revokeObjectURL(url);
         if (window.CilixAvatar) window.CilixAvatar.setMouth(0);
       };
-      audio.onerror = () => setState('idle');
+      audio.onerror = () => {
+        setState('idle');
+        URL.revokeObjectURL(url);
+      };
       audio.play()
         .then(() => {
           const ov = document.getElementById('voice-unlock');
@@ -577,6 +620,7 @@
   window.addEventListener('DOMContentLoaded', async () => {
     bindEvents();
     connect();
+    if (window.IdleActivities) window.IdleActivities.init();
     if (window.CilixAvatar) window.CilixAvatar.init();
   });
 })();

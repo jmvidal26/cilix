@@ -100,6 +100,10 @@ class CommandInterpreter:
                      "• Crear carpetas: «crea una carpeta llamada pruebas»\n"
                      "• Listar archivos: «lista los documentos de Downloads», «lista tus carpetas»\n"
                      "• Sistema: «uso de ram», «analiza la gpu», «que hora es», «procesos», «espacio en disco»\n"
+                     "• E.D.I.T.H (Le'fil): «edith estado», «edith dispositivos», «edith escanea la red», «pentest a 192.168.1.10»\n"
+                     "• Programar: «programa un script que…», «pásalo a Antigravity», «arregla este bug»\n"
+                     "• Curiosidad: «busca algo random», «aprende sobre los pulpos», «qué has aprendido»\n"
+                     "• Compañía: «cállate un rato», «ya puedes hablar»\n"
                      "• Comando literal: «!df -h»\n"
                      "• Y charlar de lo que quieras conmigo 😄")
             return Intent(kind="help", reply_hint=ayuda)

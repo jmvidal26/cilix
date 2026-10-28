@@ -122,9 +122,13 @@ class OSController:
         self.protected_paths = [
             "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64",
             "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/usr", "/var",
-            "/home", os.path.expanduser("~/.ssh"), os.path.expanduser("~/.gnupg"),
+            "/home", os.path.expanduser("~"),
+            os.path.expanduser("~/.ssh"), os.path.expanduser("~/.gnupg"),
             os.path.expanduser("~/.config"),
         ]
+        # Estas rutas solo protegen si coinciden EXACTAMENTE: /home en sí no
+        # puede borrarse, pero /home/usuario/proyecto sí (va a la papelera).
+        self._exact_protected = {"/", "/home", os.path.expanduser("~")}
 
         # Patrones peligrosos (regex) — se aplican TAMBIÉN dentro de sudo.
         self.dangerous_patterns = [
@@ -164,20 +168,41 @@ class OSController:
             if not p.startswith("/"):
                 continue
             for prot in self.protected_paths:
-                if prot == "/":
-                    if p == "/":
-                        return "/"
+                if prot in self._exact_protected:
+                    if p == prot:
+                        return prot
                 elif p == prot or p.startswith(prot + "/"):
                     return prot
         return None
 
+    # Opciones de sudo que consumen el siguiente token (usuario, grupo, etc.).
+    _SUDO_VALUE_FLAGS = {"-u", "-g", "-p", "-h", "-r", "-t", "-U", "-C",
+                         "-D", "-R", "-T"}
+
+    def _sudo_inner(self, rest: List[str]) -> List[str]:
+        """Quita las opciones propias de sudo y devuelve el comando real.
+
+        `sudo -n rm /etc/passwd` llegaba aquí con rest=['-n','rm','/etc/passwd'];
+        antes se auditaba `-n` como "comando" y el `rm` real nunca se revisaba.
+        """
+        i = 0
+        while i < len(rest) and rest[i].startswith("-"):
+            flag = rest[i]
+            i += 1
+            if flag == "--":
+                break
+            if flag in self._SUDO_VALUE_FLAGS and i < len(rest):
+                i += 1
+        return rest[i:]
+
     def _sudo_guard(self, rest: List[str]) -> Tuple[CommandSafety, str]:
         """Audita un `sudo <cmd>`: autoriza pero bloquea lo destructivo contra
         rutas del sistema y comandos de la lista negra (aunque lleven sudo)."""
-        if not rest:
+        inner_tokens = self._sudo_inner(rest)
+        if not inner_tokens:
             return CommandSafety.BLOCKED, "sudo sin comando"
-        inner = " ".join(rest)
-        inner_base = Path(rest[0]).name.lower()
+        inner = " ".join(shlex.quote(t) for t in inner_tokens)
+        inner_base = Path(inner_tokens[0]).name.lower()
         if inner_base in self.blocked_commands or inner_base == "sudo":
             return CommandSafety.BLOCKED, f"sudo {inner_base}: operación destructiva prohibida"
         for pat in self.dangerous_patterns:
@@ -191,6 +216,72 @@ class OSController:
         return safety, f"sudo permitido ({reason})"
 
     # ── Clasificación y saneado ────────────────────────────────────────────
+    @staticmethod
+    def _unquoted_shell_meta(command: str) -> Optional[str]:
+        """Devuelve el primer operador de shell FUERA de comillas, si hay.
+
+        El backend ejecuta con shell (`create_subprocess_shell`), así que un
+        `;`, `&&`, `&`, salto de línea, backtick, `$(` o redirección permitiría
+        encadenar órdenes: `ls; curl … | sh`. La lista blanca solo miraba el
+        primer token, de modo que `ls; touch /tmp/pwned` pasaba como "safe".
+        """
+        quote: Optional[str] = None
+        escaped = False
+        i = 0
+        while i < len(command):
+            ch = command[i]
+            if escaped:
+                escaped = False
+            elif ch == "\\" and quote != "'":
+                escaped = True
+            elif quote:
+                if ch == quote:
+                    quote = None
+            elif ch in ("'", '"'):
+                quote = ch
+            elif ch in ("\n", "\r", ";", "`", "&"):
+                return ch
+            elif ch == "|" and command[i + 1:i + 2] == "|":
+                return "||"
+            elif ch == "$" and command[i + 1:i + 2] == "(":
+                return "$("
+            elif ch in "<>":
+                return ch
+            i += 1
+        return None
+
+    def _pipe_error(self, tokens: List[str]) -> Optional[str]:
+        """Valida `a | b`: todos los tramos deben ser comandos SAFE conocidos.
+
+        Se mantiene el uso legítimo (`lspci | grep VGA`, `df -h | sort`) pero se
+        rechaza colar un comando desconocido en un tramo de la tubería.
+        """
+        stages: List[List[str]] = [[]]
+        for tok in tokens:
+            if tok == "|":
+                if not stages[-1]:
+                    return "tubería vacía"
+                stages.append([])
+            else:
+                stages[-1].append(tok)
+        if not stages[-1]:
+            return "tubería incompleta"
+        if len(stages) == 1:
+            return None
+        for idx, stage in enumerate(stages):
+            base = Path(stage[0]).name.lower()
+            if base == "sudo":
+                # El primer tramo puede ser sudo: se audita aparte con
+                # `_sudo_guard` (que a su vez valida el comando real).
+                if idx != 0:
+                    return "sudo solo se permite al inicio de la tubería"
+                continue
+            if base in self.blocked_commands:
+                return f"tubería con comando bloqueado: {base}"
+            if self.allowed_commands.get(base) != CommandSafety.SAFE:
+                return f"tubería con comando no verificado: {base}"
+        return None
+
     def classify(self, command: str) -> Tuple[CommandSafety, str]:
         """Determina si un comando es seguro, restringido o bloqueado."""
         clean = command.strip()
@@ -201,12 +292,20 @@ class OSController:
             if re.search(pat, clean, re.IGNORECASE):
                 return CommandSafety.BLOCKED, f"Patrón peligroso: {pat}"
 
+        meta = self._unquoted_shell_meta(clean)
+        if meta:
+            return CommandSafety.BLOCKED, f"Operador de shell no permitido: {meta!r}"
+
         try:
             parts = shlex.split(clean)
         except ValueError:
             return CommandSafety.BLOCKED, "Sintaxis inválida"
         if not parts:
             return CommandSafety.BLOCKED, "Comando vacío"
+
+        pipe_error = self._pipe_error(parts)
+        if pipe_error:
+            return CommandSafety.BLOCKED, pipe_error
 
         base = Path(parts[0]).name.lower()
         # 'sudo' se AUTORIZA pero se audita lo de dentro (no todo vale).
@@ -228,11 +327,23 @@ class OSController:
         return out.strip()
 
     def _is_path_allowed(self, path: str) -> bool:
+        """¿La ruta está DENTRO de una ruta permitida?
+
+        Antes se usaba `startswith`, así que `/home/usuario2` colaba como si
+        estuviera dentro de `/home/usuario` (prefijo común sin frontera).
+        """
         try:
-            abs_path = os.path.abspath(path)
-            return any(
-                abs_path.startswith(os.path.abspath(ap)) for ap in self.allowed_paths
-            )
+            abs_path = os.path.realpath(path)
+            for ap in self.allowed_paths:
+                root = os.path.realpath(ap)
+                if abs_path == root:
+                    return True
+                try:
+                    if os.path.commonpath([abs_path, root]) == root:
+                        return True
+                except ValueError:
+                    continue
+            return False
         except Exception:  # noqa: BLE001
             return False
 
@@ -460,13 +571,9 @@ class OSController:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(contenido)
             lineas = contenido.count("\n") + (0 if contenido.endswith("\n") else 1)
-            # Abrirlo con la app por defecto (navegador/editor) de la sesión gráfica
-            launcher = f"setsid xdg-open {shlex.quote(path)} </dev/null >/dev/null 2>&1 &"
-            try:
-                await asyncio.create_subprocess_shell(
-                    launcher, env=self._session_env(), start_new_session=True)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("xdg-open archivo falló: %r", exc)
+            # Abrirlo con la app por defecto (navegador/editor) sin pasar por
+            # el shell: la ruta ya está validada y no admite metacaracteres.
+            await self.open_path(path)
             return CommandResult(True,
                                  f"{path} · {lineas} líneas (plantilla lista para editar)",
                                  "", 0, time.time() - start, "writefile")
@@ -617,7 +724,9 @@ class OSController:
         app_name = (app_name or "").strip()
         if not app_name:
             return CommandResult(False, "", "Sin nombre de aplicación", 1, 0.0, "")
-        args = [self._sanitize(a) for a in (arguments or [])]
+        # Los argumentos NO se "sanean" quitando caracteres: se citan con
+        # shlex.quote más abajo (seguro) y así no se rompen URLs con & o ?.
+        args = [str(a) for a in (arguments or [])]
         start = time.time()
 
         # Resolver 'la terminal' al emulador realmente instalado en el sistema.
@@ -656,6 +765,29 @@ class OSController:
                                  time.time() - start, cmd)
 
     # ── Información del sistema ────────────────────────────────────────────
+    async def open_path(self, path: str) -> bool:
+        """Abre un archivo/carpeta con la app por defecto, SIN shell.
+
+        Se usa `create_subprocess_exec` (no shell) para que ninguna ruta pueda
+        inyectar comandos aunque venga del cliente WebSocket.
+        """
+        if not path or not self._is_path_allowed(path):
+            logger.warning("🚫 open_path rechazado (fuera de rutas permitidas): %s", path)
+            return False
+        real = os.path.realpath(os.path.expanduser(path))
+        try:
+            await asyncio.create_subprocess_exec(
+                "xdg-open", real,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=self._session_env(),
+                start_new_session=True,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("xdg-open falló: %r", exc)
+            return False
+
     async def get_system_info(self) -> Dict[str, Any]:
         """Recopila datos básicos del equipo usando comandos seguros."""
         hostname = (await self.execute_safe_command("hostname")).output

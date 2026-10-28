@@ -28,6 +28,10 @@ kokoro-onnx>=0.6.0           # TTS principal: voz femenina natural (ef_dora)
 # opencv-python>=4.9.0
 # pillow>=10.0.0
 
+# ── Servidor MCP (opcional: expone Cilix como herramientas al agente) ────────
+#  API v2: `from mcp.server.mcpserver import MCPServer` (ver backend/mcp_server.py)
+mcp>=2.0.0
+
 # ── Notas de instalación ──────────────────────────────────────────────────────
 #  1) Crea un venv:      python3 -m venv .venv && source .venv/bin/activate
 #  2) Instala:           pip install -r requirements.txt

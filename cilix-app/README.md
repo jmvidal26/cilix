@@ -1,9 +1,56 @@
-# Cilix · Registro de mejoras (v2.0)
+# Cilix · Registro de mejoras (v2.1)
 
 Este documento resume **las mejoras realizadas** sobre Cilix, el asistente de
 escritorio tipo VTuber 100 % local/offline (FastAPI + WebSocket + Electron +
 Live2D). Todo se ejecuta en máquina con un **límite estricto de 8 GB de RAM**
 y sin enviar nada a la nube. Los comentarios de código están en español.
+
+---
+
+## 0. Revisión v2.1 · seguridad, bugs y tests 🛡️
+
+**Seguridad (lo más importante):**
+- **WebSocket con validación de `Origin`**: antes cualquier página web abierta
+  en el navegador podía conectar a `ws://127.0.0.1:8765` y enviar `command`.
+  Ahora solo se aceptan orígenes de `localhost`/`127.0.0.1`/`::1` (o clientes
+  sin `Origin`, como scripts locales). Ver `backend/security.py`.
+- **CORS restringido** a la propia interfaz local (antes `allow_origins=["*"]`
+  con credenciales).
+- **Fin de la inyección de shell**: la lista blanca solo miraba el primer
+  token, así que `ls; touch /tmp/x` pasaba como "seguro". Ahora se rechazan
+  `;`, `&&`, `||`, `&`, saltos de línea, backticks, `$(…)` y redirecciones
+  fuera de comillas; las tuberías solo se permiten entre comandos SAFE
+  (`lspci | grep VGA` sigue funcionando).
+- **Abrir carpeta social sin shell**: la ruta del cliente se confina a
+  `~/Documents/cilix-social` y se abre con `xdg-open` vía `exec` (no shell).
+- **Rutas permitidas por frontera real** (`commonpath`): antes
+  `/home/usuario2` colaba como si estuviera dentro de `/home/usuario`.
+
+- **Sudo auditado de verdad**: al reescribir `sudo` como `sudo -n`, la
+  auditoría confundía `-n` con el comando; `sudo rm /etc/passwd` pasaba.
+  Ahora se saltan los flags de sudo y se audita el comando real.
+- **WebSocket/API con validación de `Origin`** y middleware que rechaza
+  escrituras HTTP con origen externo (CORS no basta: no bloquea el envío).
+
+**Bugs corregidos:**
+- El pulido de voz **destruía el código** (quitaba backticks y `**negritas**`
+  de los bloques ```…```). Ahora los bloques se preservan literalmente y el
+  límite de frases/caracteres se amplía en respuestas técnicas.
+- `rm` dentro de `~/…` **nunca llegaba a la papelera**: `/home` estaba
+  protegido como prefijo. Ahora solo protege exactamente `/home` (y `~`), y
+  `~/proyecto/viejo` se desvía a `gio trash`.
+- El detector de emociones marcaba **triste** con palabras como «normal»
+  (porque `mal` casaba dentro de `normal`). Ahora usa frontera de palabra.
+- «Un solo emoji» no funcionaba con ráfagas (`😄😄😄` contaba como uno).
+- La tarea de precarga de voz no se cancelaba al apagar el servidor.
+
+**Calidad / DX:**
+- **31 tests** con `unittest` (sin dependencias nuevas): comandos peligrosos,
+  sudo, orígenes, rutas, voz/código, emociones y memoria SQLite.
+- `run.sh` ya **no reinstala pip en cada arranque** (solo si cambia
+  `requirements.txt`), detecta una instancia viva y mata bien el backend en
+  modo `--dev` (`exec` + trap).
+- Documentado el **modo ONLINE opcional** (OpenCode local) en `.env.example`.
 
 ---
 
@@ -46,14 +93,14 @@ modelos de Ollama, Electron y Kokoro. Se descartó reescribir Python a C/Rust.
 ## 3. Voz más rápida ⚡
 
 **Mejora:**
-- `kokoro_speed` subido de `1.0` → **`1.15`** (habla ~15 % más ágil).
+- `kokoro_speed` subido de `1.0` → **`1.25`** (habla ~15 % más ágil).
 - **Warm-up en segundo plano** (`voice_warmup`, activo por defecto): precarga
   Kokoro ~2 s después de arrancar para que la *primera* frase no tenga retardo.
 - **Guardia de RAM** en el warm-up: si la máquina está muy cargada
   (≥ `ram_critical_percent`), se omite la precarga y se carga bajo demanda para
   no superar los 8 GB.
 
-**Config:** `CILIX_KOKORO_SPEED=1.15`, `CILIX_VOICE_WARMUP=true`.
+**Config:** `CILIX_KOKORO_SPEED=1.25`, `CILIX_VOICE_WARMUP=true`.
 
 ---
 
@@ -114,6 +161,82 @@ movía los parámetros de lágrimas → el avatar se veía **congelado**.
 
 ---
 
+## Integración con OpenCode / MCP (opcional) 🔌
+
+Cilix puede usarse como **cuerpo** de un agente (OpenCode, Claude Desktop…):
+el agente llama herramientas por MCP y Cilix habla, gesticula o recuerda.
+
+```bash
+# 1) Arranca Cilix (backend en 8765)
+./run.sh --backend
+
+# 2) Registra el servidor MCP en OpenCode (una vez)
+opencode mcp add cilix --global -- \
+  "$PWD/.venv/bin/python" "$PWD/backend/mcp_server.py"
+```
+
+Herramientas expuestas: `cilix_say`, `cilix_emotion`, `cilix_ask`,
+`cilix_state`, `cilix_remember`, `cilix_history`, `cilix_curiosity`,
+`cilix_code`, `cilix_coder_status` y `edith`.
+Por dentro usan la API REST local (`/api/say`, `/api/emotion`, `/api/ask`,
+`/api/state`, `/api/remember`), que rechaza peticiones con `Origin` externo.
+
+---
+
+## Programar con Antigravity / Qoder 🧑‍💻
+
+Cilix puede delegar una tarea de código a un agente externo **sin cargarlo en
+su proceso**: lanza `agy -p` (Antigravity CLI) o `qoder -p` (Qoder CLI) como
+subproceso, en el directorio del proyecto, y te cuenta el resultado. En reposo
+no ocupa RAM.
+
+```bash
+# Antigravity CLI (recomendado: ya está instalado y autenticado)
+agy --version
+
+# Alternativa: Qoder CLI
+qoder --version
+```
+
+Desde el chat:
+
+- «programa un script que ordene los archivos de ~/partes/pruebas»
+- «pásalo a Antigravity: arregla el bug de la API»
+- «arregla este bug en el repo ~/partes/Le-fil»
+- «haz un test para la función suma» (en el proyecto por defecto)
+
+También por API/MCP:
+
+```bash
+curl -s http://127.0.0.1:8765/api/coder \
+  -H 'Content-Type: application/json' \
+  -d '{"task":"crea un hola.py que imprima hola","workspace":"/home/jesvid/partes/pruebas"}'
+```
+
+Herramientas MCP nuevas: `cilix_code` y `cilix_coder_status`.
+
+**Permisos (importante).** En modo headless el CLI no puede preguntar, así que:
+
+- Los archivos dentro del proyecto se editan sin preguntar (`accept-edits`).
+- Los comandos de terminal se **deniegan** por defecto. Para permitir algunos,
+  añade reglas en `~/.gemini/antigravity-cli/settings.json`:
+
+  ```json
+  {"permissions": {"allow": ["command(python3)", "command(pytest)",
+                             "command(git status)", "command(git diff)"]}}
+  ```
+
+- Si quieres que el agente ejecute lo que necesite sin preguntar, pon
+  `CILIX_CODER_AUTO=true`: se usa `--dangerously-skip-permissions` **junto con
+  `--sandbox`**, que aísla los comandos y bloquea archivos sensibles (`~/.ssh`,
+  `.env`). Aun así, revisa el primer uso. También puedes pedirlo solo para una
+  tarea: «programa en modo autónomo un script que…».
+- `CILIX_CODER_ROOTS` limita en qué carpetas puede trabajar Cilix.
+- Antigravity envía el código a Google para razonar. Si el proyecto es privado,
+  usa `CILIX_CODER_MODE=plan` o no lo delegues.
+
+---
+
 ## Cómo arrancar
 
 ```bash
@@ -135,11 +258,19 @@ carga bajo demanda. Con menos programas abiertos, la voz responde más rápido.
 
 ## Verificación
 
-- `node --check live2d.js` / `app.js` → OK
-- `py_compile` de los módulos backend → OK
-- Defaults confirmados: `kokoro_speed=1.15`, `voice_warmup=True`
+```bash
+# Tests de seguridad, voz, emociones y memoria (sin dependencias extra)
+.venv/bin/python -m unittest discover -s tests -v
+
+# Comprobación de sintaxis
+.venv/bin/python -m py_compile backend/*.py
+node --check frontend/js/live2d.js && node --check frontend/js/app.js
+```
+
+- Defaults confirmados: `kokoro_speed=1.25`, `voice_warmup=True`
 - Smoke test WebSocket: `mode: Ri | emotion: feliz` (fallback OK),
   `speak dur:2.11s frames:53 max:0.716` (lip-sync poblando correctamente)
+- `Origin` externo → el WebSocket se cierra con código `1008`.
 
 ---
 
@@ -152,6 +283,9 @@ carga bajo demanda. Con menos programas abiertos, la voz responde más rápido.
 | `CILIX_RI_KEEP_ALIVE` | `2m` | Tiempo que Ri permanece en RAM |
 | `CILIX_TTS_BACKEND` | `kokoro` | Motor de voz (Kokoro femenino) |
 | `CILIX_KOKORO_VOICE` | `ef_dora` | Voz femenina en español |
-| `CILIX_KOKORO_SPEED` | `1.15` | >1 = habla más rápido |
+| `CILIX_KOKORO_SPEED` | `1.25` | >1 = habla más rápido |
 | `CILIX_VOICE_WARMUP` | `true` | Precarga de voz (con guardia de RAM) |
 | `CILIX_RAM_CRITICAL` | `88` | % de RAM que desactiva el warm-up |
+| `CILIX_ONLINE` | `false` | Cerebro en OpenCode local (con fallback a Ollama) |
+| `CILIX_ONLINE_FALLBACK` | `true` | Si OpenCode falla, responde Ollama |
+| `CILIX_OPENCODE_SESSION` | `Cilix · voz` | Sesión dedicada dentro de OpenCode |

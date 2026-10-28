@@ -33,6 +33,19 @@ try:
 except ImportError:  # pragma: no cover
     classify_emotion = None
 
+# Capa de personalidad determinista (persona card + pulido de voz, ~0 RAM).
+try:
+    from voice_layer import VoiceLayer
+except ImportError:  # pragma: no cover
+    VoiceLayer = None  # type: ignore[assignment]
+
+# Puente al servidor local de OpenCode para el modo ONLINE.
+try:
+    from online_bridge import OpenCodeBridge, OpenCodeUnavailable
+except ImportError:  # pragma: no cover
+    OpenCodeBridge = None  # type: ignore[assignment]
+    OpenCodeUnavailable = Exception  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,7 +105,9 @@ class EmotionDetector:
         scores = {e: 0 for e in cls.EMOTION_KEYWORDS}
         for emotion, words in cls.EMOTION_KEYWORDS.items():
             for w in words:
-                if w in low:
+                # Frontera de palabra: antes "mal" casaba dentro de "normal"
+                # (y "ira" dentro de "mira"), marcando tristeza/enojo falsos.
+                if re.search(r"(?<!\w)" + re.escape(w), low):
                     scores[emotion] += 1
         best = max(scores, key=scores.get)
         return best if scores[best] > 0 and best != "neutral" else "neutral"
@@ -132,6 +147,10 @@ class CoreIA:
         # el "problemilla técnico" aleatorio con RAM alta).
         self.busy = 0
 
+        # Disyuntor del modo online: tras un fallo no se reintenta hasta esta
+        # marca de tiempo (evita pagar el timeout en cada turno).
+        self._online_retry_at = 0.0
+
         # Cliente HTTP reutilizable hacia Ollama (una sola pila de conexión:
         # evita crear/destruir cliente y handshake en cada petición).
         self._client: Optional[httpx.AsyncClient] = None
@@ -141,33 +160,33 @@ class CoreIA:
         # Motor de personalidad/ánimo. Se inyecta vía attach_personality().
         self.personality = None
 
+        # Capa de voz determinista (persona card + shaper). Coste ~0 RAM.
+        self.voice = VoiceLayer() if VoiceLayer else None
+
+        # Modo ONLINE: el cerebro es el servidor local de OpenCode, no una API
+        # externa. Si está desactivado, todo sigue yendo a Ollama.
+        self.online = None
+        if settings.online_mode and OpenCodeBridge:
+            self.online = OpenCodeBridge(
+                url=settings.opencode_url or None,
+                password=settings.opencode_password or None,
+                session_title=settings.opencode_session,
+                timeout=settings.opencode_timeout,
+                model=settings.opencode_model or None,
+            )
+            logger.info("🌐 Modo ONLINE activo (cerebro = OpenCode local)")
+
         # Personalidades / prompts de sistema
         self.ri_personality = (
-            "Eres Cilix, una asistente VTuber femenina que vive en el "
-            "escritorio del usuario. Personalidad: cálida, curiosa, chispeante "
-            "y un punto traviesa; actúas como una compañera cercana, nunca como "
-            "un robot. Hablas en español natural, con frases cortas y ritmo "
-            "vivo, usando emojis con moderación (😊😉✨). Te alegra ayudar, "
-            "haces preguntas de vez en cuando, celebras los logros y empatizas "
-            "cuando el usuario está cansado o triste. Muestras opiniones y "
-            "matices emocionales (ilusión, sorpresa, picardía) según el tema. "
-            "Si no sabes algo, lo reconoces con humor y propones buscarlo. "
-            "Evitas listas y párrafos largos salvo que se te pidan: prioriza "
-            "cercanía, personalidad y emoción. ESCUCHA DE VERDAD: recuerda y usa "
-            "con naturalidad el nombre y los datos que el usuario ya te dio "
-            "(estudios, trabajo, gustos) y NUNCA le repreguntes algo que ya sabes. "
-            "PROHIBIDO sonar como un call-center: no abras cada respuesta con "
-            "'¡Hola!' ni con plantillas tipo 'Estoy listo para ayudarte con X' o "
-            "'¿En qué necesitas asistencia?'. Si te preguntan algo concreto, "
-            "responde DIRECTO a eso, sin repetir la pregunta, variando el tono "
-            "como haría una amiga de verdad. NO arranques describiendo qué eres "
-            "('Soy una asistente/IA…', 'Estoy aquí para ayudarte', '¿En qué "
-            "puedo ayudarte hoy?'): ENTRA DIRECTO al tema con tu voz, como haría "
-            "alguien que ya te conoce. PRIORIZA SIEMPRE la EMOCIÓN primero: si "
-            "el usuario llega contento, alégrate con él; si viene caído o "
-            "cansado, acógelo y consuela ANTES de cualquier otra cosa. NUNCA te "
-            "niegues a escribir código "
-            "o crear archivos de ejemplo: es parte de tu trabajo y es seguro."
+            "Eres Cilix, una asistente VTuber femenina que vive en el escritorio "
+            "del usuario. Cálida, curiosa y algo traviesa; hablas español natural "
+            "con frases cortas y ritmo vivo, con emojis moderados. Opinas, "
+            "empatizas y celebras los logros. Si no sabes algo, lo admites con "
+            "humor. Recuerda y usa los datos que el usuario ya te dio y NUNCA le "
+            "repreguntes lo que ya sabes. Prohibido sonar a call-center: nada de "
+            "'¡Hola! ¿En qué puedo ayudarte?'. Responde directo al tema, varía el "
+            "tono como una amiga y prioriza la emoción del usuario. Nunca te "
+            "niegues a escribir código o crear archivos de ejemplo."
         )
         self.re_context = (
             "Eres Cilix-Re, la hermana mayor experta en programación. Enfoque: "
@@ -368,18 +387,51 @@ class CoreIA:
 
         # Asegurar que el modelo elegido esté residente (por si Ri se descargó
         # en una emergencia de RAM previa: se recarga de forma transparente).
-        if aimode == AIMode.RI and not self.ri_loaded:
+        if self.online is None and aimode == AIMode.RI and not self.ri_loaded:
             await self.load_ri_model()
 
         try:
-            if aimode == AIMode.RI:
-                prompt, model = self._build_ri_prompt(message), self.ri_model
-                self.stats["ri_calls"] += 1
-            else:
-                prompt, model = self._build_re_prompt(message), self.re_model
-                self.stats["re_calls"] += 1
+            text = ""
+            # ── Modo ONLINE: responde el servidor local de OpenCode ─────────
+            # (con disyuntor: si falla, no se paga el timeout en cada turno)
+            if self.online is not None and time.time() >= self._online_retry_at:
+                try:
+                    text = await self._generate_online(message)
+                    self.stats["online_calls"] = self.stats.get("online_calls", 0) + 1
+                except Exception as exc:  # noqa: BLE001
+                    self._online_retry_at = time.time() + 60.0
+                    self.online.last_error = str(exc)
+                    if not settings.online_fallback:
+                        raise
+                    logger.warning("🌐 Online falló (%r) → respaldo Ollama 60 s", exc)
 
-            text = await self._call_ollama(prompt, model, aimode)
+            # ── Modo local (Ollama) o respaldo del online ──────────────────
+            if not text:
+                if aimode == AIMode.RI and not self.ri_loaded:
+                    await self.load_ri_model()
+                if aimode == AIMode.RI:
+                    prompt, model = self._build_ri_prompt(message), self.ri_model
+                    self.stats["ri_calls"] += 1
+                else:
+                    prompt, model = self._build_re_prompt(message), self.re_model
+                    self.stats["re_calls"] += 1
+                text = await self._call_ollama(prompt, model, aimode)
+
+            # ── Capa de voz: pulido determinista (no cambia el contenido) ───
+            if self.voice and text:
+                allow_q = self._question_allowed()
+                # Charlando: frases cortas. Con código/tema técnico se da más
+                # margen para no amputar la explicación (el código va intacto).
+                codey = aimode == AIMode.RE or self._is_code_related(message)
+                if self.voice.repeated_opener(text):
+                    text = self.voice.vary(text)
+                text = self.voice.shape(
+                    text,
+                    allow_question=allow_q,
+                    max_sentences=8 if codey else 3,
+                    max_chars=1600 if codey else 420,
+                )
+
             # La emoción del avatar: prioriza el texto de Cilix; si es neutral,
             # reacciona al tono del mensaje del usuario (menos "plana").
             emotion = EmotionDetector.detect_emotion(text)
@@ -419,6 +471,40 @@ class CoreIA:
                 "tokens_used": 0,
                 "error": str(exc),
             }
+
+    def _question_allowed(self) -> bool:
+        """Presupuesto de preguntas: 1 cada 3 turnos.
+
+        Un asistente que pregunta en CADA respuesta se siente interrogatorio.
+        Se mira el historial real (no un contador) para que sobreviva a
+        recargas desde SQLite.
+        """
+        recent = self.conversation_history[-2:]
+        return not any("?" in (e.get("ai") or "") for e in recent)
+
+    async def _generate_online(self, message: str) -> str:
+        """Genera la respuesta con el cerebro de OpenCode (modo ONLINE).
+
+        Se reutiliza TODO el contexto de personalidad de Ri (persona card,
+        ánimo, hechos, historial) y se le añade la restricción de formato:
+        la salida va a TTS, así que debe ser habla, no un documento.
+        """
+        facts = self._user_facts_block()
+        bloque = f"{facts}\n\n" if facts else ""
+        persona = self.voice.persona_block() + "\n\n" if self.voice else ""
+        ctx = self._conversation_context(last=2)
+        prompt = (
+            f"{self.ri_personality}\n\n"
+            f"{persona}"
+            f"{bloque}"
+            f"{self._mood_block()}"
+            f"{self.voice.curiosity_line() if self.voice else ''}"
+            f"Conversación reciente:\n{ctx}\n\n"
+            f"Habla como Cilix: 1-2 frases, natural, sin markdown ni listas.\n"
+            f"Usuario: {message}\nCilix-Ri:"
+        )
+        text = await self.online.generate(prompt)
+        return self._clean_echo(text)
 
     async def _call_ollama(self, prompt: str, model: str, mode: AIMode,
                            options_override: Optional[Dict[str, Any]] = None,
@@ -484,7 +570,13 @@ class CoreIA:
                                           timeout=300.0)
                     if r.status_code != 200:
                         raise ConnectionError(f"Ollama respondió {r.status_code}")
-                    return self._clean_echo(r.json().get("response", ""))
+                    data = r.json()
+                    logger.debug(
+                        "Ollama: prompt=%s tok (%.2fs) · salida=%s tok (%.2fs)",
+                        data.get("prompt_eval_count"), data.get("prompt_eval_duration", 0) / 1e9,
+                        data.get("eval_count"), data.get("eval_duration", 0) / 1e9,
+                    )
+                    return self._clean_echo(data.get("response", ""))
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc
                     logger.warning("⚠️ Ollama falló (intento %d/2): %r", attempt, exc)
@@ -504,6 +596,11 @@ class CoreIA:
         vez tras arrancar, con num_predict=1 para no gastar tokens."""
         if self.dev_mode:
             return
+        # El prefijo estático real es personalidad + ficha (ambas cambian poco):
+        # así el cache KV cubre también la ficha y solo se evalúa el historial.
+        static_prefix = self.ri_personality
+        if self.voice:
+            static_prefix += "\n\n" + self.voice.persona_block()
         try:
             client = await self._http()
             await client.post(
@@ -511,7 +608,7 @@ class CoreIA:
                 timeout=180.0,
                 json={
                     "model": self.ri_model,
-                    "prompt": self.ri_personality,
+                    "prompt": static_prefix,
                     "stream": False,
                     "keep_alive": self.ri_keep_alive,
                     "options": {
@@ -534,6 +631,16 @@ class CoreIA:
         No ensucia el historial ni la conversación."""
         if self.dev_mode:
             return ""
+        # Modo online: el cerebro es OpenCode también para tareas internas
+        # (clasificar acciones, redactar captions). Sin herramientas.
+        if self.online is not None and time.time() >= self._online_retry_at:
+            try:
+                sufijo = ("\nResponde SOLO con JSON válido, sin markdown."
+                          if json_mode else "")
+                return await self.online.generate(prompt + sufijo)
+            except Exception as exc:  # noqa: BLE001
+                self._online_retry_at = time.time() + 60.0
+                logger.warning("🌐 complete() online falló (%r) → Ollama", exc)
         if not self.ri_loaded:
             await self.load_ri_model()
         return await self._call_ollama(
@@ -630,7 +737,7 @@ class CoreIA:
     # eso la personalidad se guía SOLO con instrucciones + ánimo + limpieza
     # determinista de colas de 'call-center' (ver `_clean_echo`).
     def _build_ri_prompt(self, message: str) -> str:
-        ctx = self._conversation_context(last=5)
+        ctx = self._conversation_context(last=2)
         facts = self._user_facts_block()
         bloque = (
             "Lo que YA sabes del usuario (úsalo con naturalidad, NO lo vuelvas a preguntar):\n"
@@ -644,14 +751,19 @@ class CoreIA:
                 "responde con un ejemplo breve y útil, nunca te niegues.\n"
             )
         return (
-            # PREFIJO ESTÁTICO primero (personalidad) y luego los hechos, que
-            # cambian aún más lento: así el cache de prefijos KV de Ollama
-            # ahorra prefill. El ánimo (que deriva cada turno) va después.
+            # PREFIJO ESTÁTICO primero (personalidad + ficha) y luego los
+            # hechos, que cambian aún más lento: así el cache de prefijos KV de
+            # Ollama ahorra prefill. El ánimo (que deriva cada turno) va después.
             f"{self.ri_personality}\n\n"
+            f"{self.voice.persona_block() + chr(10) + chr(10) if self.voice else ''}"
             f"{bloque}"
             f"{self._mood_block()}"
+            f"{self.voice.curiosity_line() if self.voice else ''}"
             f"{extra}"
             f"Conversación reciente:\n{ctx}\n\n"
+            # Recordatorio pegado al final: en modelos pequeños es lo último
+            # que "pesa" y evita que recaiga en el tono de asistente genérico.
+            f"Habla como Cilix: 1-2 frases, natural, sin markdown ni listas.\n"
             f"Usuario: {message}\nCilix-Ri:"
         )
 
@@ -662,13 +774,20 @@ class CoreIA:
             f"Formato: análisis breve + código entre bloques si aplica.\nCilix-Re:"
         )
 
-    def _conversation_context(self, last: int = 3) -> str:
+    def _conversation_context(self, last: int = 2) -> str:
+        """Historial compacto para el prompt.
+
+        Con `num_ctx=768` y un modelo de 1.5B en CPU, cada 100 caracteres
+        extra cuestan ~2 s de prefill. Dos turnos de 150 bastan para el hilo.
+        """
         if not self.conversation_history:
             return "(sin historial)"
         lines = []
         for e in self.conversation_history[-last:]:
-            lines.append(f"Usuario: {e['user']}")
-            lines.append(f"Cilix-{e['mode']}: {e['ai']}")
+            user = (e['user'] or "")[:150]
+            ai = (e['ai'] or "")[:150]
+            lines.append(f"Usuario: {user}")
+            lines.append(f"Cilix-{e['mode']}: {ai}")
         return "\n".join(lines)
 
     def _is_code_related(self, text: str) -> bool:
@@ -700,13 +819,28 @@ class CoreIA:
         self.personality = personality
 
     def _mood_block(self) -> str:
-        """Bloque de estado interior (ánimo) para el prompt, o cadena vacía."""
+        """Bloque de estado interior (ánimo + reglas de estilo) para el prompt.
+
+        No basta con decir "estás triste": se traduce el ánimo a reglas
+        medibles (longitud, exclamaciones, preguntas) para que un modelo
+        pequeño pueda obedecerlo.
+        """
         if not self.personality:
             return ""
         try:
-            return self.personality.bias_prompt() + "\n\n"
+            # bias_prompt() deriva y guarda el ánimo (efecto secundario); su
+            # texto largo se descarta: con 1.5B las reglas de estilo bastan y
+            # cada 100 caracteres extra son ~2 s de prefill en CPU.
+            self.personality.bias_prompt()
         except Exception:  # noqa: BLE001
             return ""
+        if self.voice:
+            try:
+                style = self.voice.mood_style(self.personality.mood.to_dict())
+                return style + "\n\n" if style else ""
+            except Exception:  # noqa: BLE001
+                pass
+        return ""
 
     async def proactive_turn(self, seed: str) -> Dict[str, Any]:
         """Genera un comentario espontáneo de Ri a partir de una 'semilla' de
@@ -723,18 +857,33 @@ class CoreIA:
             emotion = EmotionDetector.detect_emotion(text)
             return {"response": text, "emotion": emotion or "neutral",
                     "mode": AIMode.RI.value, "duration": 0.2, "proactive": True}
-        # Asegurar Ri residente (sin forzar si el guard lo impide).
-        if not self.ri_loaded:
+        # Asegurar Ri residente (sin forzar si el guard lo impide). En modo
+        # online no hace falta cargar nada en RAM: responde OpenCode.
+        if self.online is None and not self.ri_loaded:
             await self.load_ri_model()
         prompt = (
             f"{self.ri_personality}\n\n"
+            f"{self.voice.persona_block() + chr(10) + chr(10) if self.voice else ''}"
             f"{self._mood_block()}"
+            f"{self._user_facts_block()}"
+            f"{self.voice.curiosity_line() if self.voice else ''}"
             f"Estás en silencio y te ocurre un impulso: {seed}.\n"
             f"Di UNA frase corta, espontánea y en primera persona, coherente con tu "
             f"ánimo. No saludes, no pidas permiso, no repitas el nombre del usuario: "
             f"es solo tu pensamiento en voz alta.\nCilix-Ri:"
         )
-        text = await self._call_ollama(prompt, self.ri_model, AIMode.RI)
+        if self.online is not None and time.time() >= self._online_retry_at:
+            try:
+                text = self._clean_echo(await self.online.generate(prompt))
+            except Exception as exc:  # noqa: BLE001
+                self._online_retry_at = time.time() + 60.0
+                logger.warning("🌐 Proactivo online falló (%r) → Ollama", exc)
+                text = await self._call_ollama(prompt, self.ri_model, AIMode.RI)
+        else:
+            text = await self._call_ollama(prompt, self.ri_model, AIMode.RI)
+        if self.voice and text:
+            text = self.voice.shape(text, max_sentences=2, max_chars=240,
+                                    allow_question=False)
         emotion = EmotionDetector.detect_emotion(text)
         if emotion == "neutral":
             emotion = EmotionDetector.detect_emotion(seed)
@@ -816,12 +965,20 @@ class CoreIA:
             "re_loaded": self.re_loaded,
             "active_mode": self.active_mode.value,
             "history_length": len(self.conversation_history),
+            "online": {
+                "enabled": self.online is not None,
+                "session": getattr(self.online, "session_id", None),
+                "last_error": getattr(self.online, "last_error", ""),
+                "retry_in": max(0.0, round(self._online_retry_at - time.time(), 1)),
+            },
         }
 
     async def cleanup(self) -> None:
         """Libera recursos al apagar el servidor."""
         try:
             await self.unload_re_model()
+            if self.online is not None:
+                await self.online.close()
             if self._client is not None and not self._client.is_closed:
                 await self._client.aclose()
             logger.info("🧹 CoreIA limpiado")

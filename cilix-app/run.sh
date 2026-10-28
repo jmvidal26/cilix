@@ -28,9 +28,18 @@ if [[ ! -x "$PY" ]]; then
   python3 -m venv "$VENV"
 fi
 
-echo "📦 Instalando dependencias Python (solo si hace falta)…"
-"$PY" -m pip install -q --upgrade pip
-"$PY" -m pip install -q -r requirements.txt
+echo "📦 Comprobando dependencias Python…"
+# Instala solo si `requirements.txt` cambió (antes hacía pip install en CADA
+# arranque: varios segundos y tráfico de red innecesario).
+REQ_HASH="$(sha256sum requirements.txt | awk '{print $1}')"
+REQ_STAMP="$VENV/.requirements.sha256"
+if [[ ! -f "$REQ_STAMP" || "$(cat "$REQ_STAMP")" != "$REQ_HASH" ]]; then
+  "$PY" -m pip install -q --upgrade pip
+  "$PY" -m pip install -q -r requirements.txt
+  printf '%s' "$REQ_HASH" > "$REQ_STAMP"
+else
+  echo "   ✔ Dependencias al día"
+fi
 
 # ── 2) Variables de entorno ────────────────────────────────────────────────
 [[ -f .env ]] || { cp .env.example .env && echo "📝 Creado .env desde el ejemplo"; }
@@ -69,16 +78,29 @@ echo "💾   RAM disponible: $((AVAIL_KB/1024)) MB"
 # ── 4) Arranque ────────────────────────────────────────────────────────────
 start_backend_bg() {
   # Lanza el backend Python en segundo plano y devuelve su PID.
-  (cd "$SCRIPT_DIR/backend" && "$PY" main.py) &
+  # `exec` garantiza que el PID sea el de Python (no el de una subshell), así
+  # el trap de salida lo mata de verdad.
+  (cd "$SCRIPT_DIR/backend" && exec "$PY" main.py "$@") &
   BACKEND_PID=$!
 }
+
+# Si ya hay una instancia viva, no se arranca otra (chocarían por el puerto).
+ALREADY_RUNNING=0
+if curl -s "$URL/health" >/dev/null 2>&1; then
+  ALREADY_RUNNING=1
+fi
 
 case "$MODE" in
   --backend|backend)
     echo "🚀 Backend en ${URL} (Ctrl+C para detener)"
-    (cd backend && "$PY" main.py "${@:2}")
+    (cd backend && exec "$PY" main.py "${@:2}")
     ;;
   --browser|browser|"")
+    if [[ "$ALREADY_RUNNING" == "1" ]]; then
+      echo "ℹ️   Cilix ya está corriendo en $URL"
+      xdg-open "$URL" >/dev/null 2>&1 || true
+      exit 0
+    fi
     echo "🌐 Modo navegador (bajo en RAM, sin Electron)…"
     start_backend_bg
     trap 'kill ${BACKEND_PID:-0} 2>/dev/null || true' EXIT INT TERM
@@ -93,9 +115,8 @@ case "$MODE" in
     ;;
   --dev|dev)
     echo "🛠️  Modo desarrollo…"
-    (cd backend && "$PY" main.py --dev &)
-    BACKEND_PID=$!
-    trap 'kill $BACKEND_PID 2>/dev/null || true' EXIT
+    start_backend_bg --dev
+    trap 'kill ${BACKEND_PID:-0} 2>/dev/null || true' EXIT INT TERM
     npx --yes electron . --dev
     ;;
   --app|app|--electron|electron)
@@ -105,6 +126,12 @@ case "$MODE" in
       npm install
     fi
     echo "🚀 Lanzando Cilix (Electron + backend)…"
-    npm start
+    # Electron arranca su propio backend; si ya había uno, se reutiliza.
+    if [[ "$ALREADY_RUNNING" == "1" ]]; then
+      echo "ℹ️   Reutilizando el backend que ya corre en $URL"
+      CILIX_NO_BACKEND=1 npm start
+    else
+      npm start
+    fi
     ;;
 esac

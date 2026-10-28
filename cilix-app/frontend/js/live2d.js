@@ -64,6 +64,10 @@
     _t0: 0,
     _blinkStart: -1, _nextBlinkAt: 1.2,
     _pointer: { x: 0, y: 0, active: false },
+    // Paseo: desplaza el avatar a izquierda/derecha sin tocar _homeX, así el
+    // arrastre manual sigue funcionando y al terminar vuelve solo a su sitio.
+    _walking: false,
+    _baseScale: 0,
 
     /* ── Inicialización ─────────────────────────────────────────────────── */
     async init() {
@@ -93,8 +97,11 @@
           autoInteract: false,     // la UI no debe capturar el canvas
         });
 
-        this._layoutModel();
         this.app.stage.addChild(this.model);
+        this._layoutModel();
+        // Los bounds del modelo no son fiables hasta el primer render: se
+        // recalcula en el siguiente frame para evitar una escala enorme.
+        requestAnimationFrame(() => this._layoutModel());
         window.addEventListener('resize', () => this._layoutModel());
         this._enableDrag();
         this._enableEyeTracking();
@@ -151,12 +158,28 @@
     /* Encuentra y centra/escala el modelo según la ventana. */
     _layoutModel() {
       if (!this.model || !this.app) return;
-      const w = this.app.renderer.width / this.app.renderer.resolution;
-      const h = this.app.renderer.height / this.app.renderer.resolution;
-      const scale = Math.min(w / this.model.width, (h * 0.9) / this.model.height);
+      // Se usan las dimensiones de la ventana (el canvas la cubre entera).
+      // El renderer puede seguir en 1×1 durante el primer frame con `resizeTo`.
+      const w = window.innerWidth || this.app.renderer.width || 1;
+      const h = window.innerHeight || this.app.renderer.height || 1;
+      // `model.width/height` incluyen la escala actual, así que se miden una
+      // sola vez en escala 1. Si no, cada resize volvía a escalar en cascada.
+      if (!this._baseW || !this._baseH) {
+        const prev = this.model.scale.x;
+        this.model.scale.set(1);
+        this._baseW = this.model.width;
+        this._baseH = this.model.height;
+        this.model.scale.set(prev, prev);
+      }
+      const bw = this._baseW || 0;
+      const bh = this._baseH || 0;
+      if (!bw || !bh) return;
+      const scale = Math.min(w / bw, (h * 0.9) / bh);
+      if (!isFinite(scale) || scale <= 0) return;
+      this._baseScale = scale;
       this.model.scale.set(scale);
-      this._homeX = (w - this.model.width) / 2;
-      this._homeY = h - this.model.height;   // apoyado en la parte inferior
+      this._homeX = (w - bw * scale) / 2;
+      this._homeY = h - bh * scale;   // apoyado en la parte inferior
       this.model.x = this._homeX;
       this.model.y = this._homeY;
     },
@@ -227,6 +250,22 @@
       this.mouthTarget = Math.max(0, Math.min(1, value));
     },
 
+    /* ── Paseo (actividad de aburrimiento) ──────────────────────────────── */
+    /* Activa un vaivén horizontal suave. No modifica _homeX: es un offset
+       que se suma en el bucle idle, así arrastrar el avatar no lo rompe. */
+    setWalking(on) {
+      const next = !!on;
+      if (this._walking === next) return;
+      this._walking = next;
+      if (!next && this.model && this._baseScale) {
+        this.model.scale.x = this._baseScale;   // recupera la orientación
+      }
+    },
+
+    isWalking() {
+      return !!this._walking;
+    },
+
     /* ── Bucle de animación (suavizado) ─────────────────────────────────── */
     _startIdleLoop() {
       this._t0 = performance.now() / 1000;
@@ -292,8 +331,25 @@
             this._setParam('ParamAngleZ', Math.sin(t * 0.2) * 3);
           }
           const talkBob = this._talking ? Math.sin(t * 6) * mh * 0.004 : 0;
-          this.model.x = this._homeX + swayX + parX;
-          this.model.y = this._homeY + breathe + talkBob + parY;
+
+          // Paseo: vaivén amplio + pasitos (bob) y giro según la dirección.
+          let walkX = 0, walkBob = 0;
+          if (this._walking) {
+            const vw = window.innerWidth || 800;
+            const mw = Math.abs(this.model.width) || 0;
+            // No salirse de la pantalla: margen disponible a cada lado.
+            const space = Math.max(0, Math.min(this._homeX, vw - this._homeX - mw));
+            const range = Math.min(vw * 0.24, 260, space);
+            walkX = Math.sin(t * 0.85) * range;
+            walkBob = Math.abs(Math.sin(t * 7)) * mh * 0.012;
+            if (this._baseScale) {
+              this.model.scale.x = this._baseScale *
+                (Math.cos(t * 0.85) >= 0 ? 1 : -1);
+            }
+          }
+
+          this.model.x = this._homeX + swayX + parX + walkX;
+          this.model.y = this._homeY + breathe + talkBob + parY + walkBob;
         }
         this._raf = requestAnimationFrame(apply);
       };

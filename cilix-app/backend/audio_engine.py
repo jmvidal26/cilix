@@ -120,6 +120,7 @@ class AudioEngine:
         self._last_tts_use = 0.0
         self._last_stt_use = 0.0
         self._releaser: Optional[asyncio.Task] = None
+        self._warmup_task: Optional[asyncio.Task] = None
 
         logger.info(
             "🎵 AudioEngine (Whisper=%s, Kokoro=%s, Piper=%s, backend=%s)",
@@ -140,7 +141,7 @@ class AudioEngine:
         logger.info("🎵 AudioEngine en modo diferido (Piper/Whisper lazy-load)")
         if getattr(settings, "voice_warmup", False):
             try:
-                asyncio.create_task(self._warmup())
+                self._warmup_task = asyncio.create_task(self._warmup())
             except Exception:  # noqa: BLE001
                 pass
         # Vigilante de reposo: descarga Kokoro/Piper/Whisper tras un rato sin
@@ -172,6 +173,13 @@ class AudioEngine:
                     released = True
                 if released:
                     gc.collect()
+                    # gc libera los objetos de Python, pero glibc suele
+                    # conservar las páginas: malloc_trim las devuelve al SO.
+                    try:
+                        import ctypes
+                        ctypes.CDLL("libc.so.6").malloc_trim(0)
+                    except Exception:  # noqa: BLE001
+                        pass
                     logger.info("🎵 Motores de voz descargados por inactividad "
                                 "(RAM liberada; se recargarán solos)")
             except asyncio.CancelledError:
@@ -563,9 +571,11 @@ class AudioEngine:
 
     def cleanup(self) -> None:
         """Borra archivos temporales antiguos (>1 h) y detiene al vigilante."""
-        if self._releaser:
-            self._releaser.cancel()
-            self._releaser = None
+        for task in (self._releaser, self._warmup_task):
+            if task:
+                task.cancel()
+        self._releaser = None
+        self._warmup_task = None
         try:
             for f in self.temp_dir.glob("*.wav"):
                 if time.time() - f.stat().st_mtime > 3600:
